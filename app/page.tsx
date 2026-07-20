@@ -33,6 +33,7 @@ type StoredSettings = {
   ttsLang: Lang;
   role: Role;
   onboarded: boolean;
+  studentName: string;
 };
 
 // A tiny speaker icon reused throughout.
@@ -93,6 +94,8 @@ export default function Page() {
   const [room, setRoom] = useState("class-1");
   const [wsStatus, setWsStatus] = useState<WsStatus>("idle");
   const [peers, setPeers] = useState(0);
+  const [roster, setRoster] = useState<string[]>([]); // teacher: names of joined students
+  const [studentName, setStudentName] = useState(""); // student: their display name
 
   // ---- refs ----
   const curTextRef = useRef("");
@@ -428,9 +431,9 @@ export default function Page() {
     setPeers(0);
   }, []);
 
-  // Open a WebSocket to the room and resolve once it's connected.
+  // Open a WebSocket to the room, announce who we are, and resolve once connected.
   const connectWs = useCallback(
-    (r: string) =>
+    (r: string, identityRole: Role, name: string) =>
       new Promise<WebSocket>((resolve, reject) => {
         setWsStatus("connecting");
         let ws: WebSocket;
@@ -443,6 +446,7 @@ export default function Page() {
         }
         ws.onopen = () => {
           setWsStatus("connected");
+          ws.send(JSON.stringify({ type: "hello", role: identityRole, name }));
           resolve(ws);
         };
         ws.onmessage = (ev) => {
@@ -452,8 +456,10 @@ export default function Page() {
           } catch {
             return;
           }
-          if (msg.type === "joined") {
-            setPeers(typeof msg.peers === "number" ? msg.peers : 0);
+          if (msg.type === "roster") {
+            // Teacher's live list of joined students.
+            setRoster(Array.isArray(msg.students) ? msg.students : []);
+            setPeers(typeof msg.count === "number" ? msg.count : 0);
           } else if (msg.type === "caption") {
             // Incoming caption from the teacher (students only receive these).
             if (msg.final) {
@@ -473,6 +479,7 @@ export default function Page() {
         ws.onclose = () => {
           setWsStatus("idle");
           setPeers(0);
+          setRoster([]);
         };
         wsRef.current = ws;
       }),
@@ -497,7 +504,7 @@ export default function Page() {
     }
     let ws: WebSocket;
     try {
-      ws = await connectWs(room);
+      ws = await connectWs(room, "teacher", "Teacher");
     } catch {
       setWsStatus("idle");
       announce("Could not connect to the class. Is the backend running?");
@@ -533,23 +540,31 @@ export default function Page() {
     recognitionRef.current = rec;
     rec.start();
     setCapActive(true);
-    announce("Broadcasting live captions to the class.");
+    announce("Class is live. Broadcasting captions to your students.");
     logUsage("F3", "broadcast_start", { room });
   }, [connectWs, room, announce, stopBroadcast]);
+
+  // Generate a fresh, human-friendly class code (teacher "create class").
+  const newClassCode = useCallback(() => {
+    const suffix = Math.random().toString(36).replace(/[^a-z0-9]/g, "").slice(0, 4).toUpperCase();
+    setRoom(`CLASS-${suffix || "0000"}`);
+    setRoster([]);
+    announce("Created a new class code.");
+  }, [announce]);
 
   // ---- student: join / leave the live class ----
   const joinClass = useCallback(async () => {
     setCapFinal("");
     setCapInterim("");
     try {
-      await connectWs(room);
+      await connectWs(room, "student", studentName.trim() || "Guest");
       announce("Joined the class. Captions will appear as the teacher speaks.");
       logUsage("F3", "join_class", { room });
     } catch {
       setWsStatus("idle");
       announce("Could not connect to the class. Is the backend running?");
     }
-  }, [connectWs, room, announce]);
+  }, [connectWs, room, studentName, announce]);
 
   const leaveClass = useCallback(() => {
     closeWs();
@@ -619,6 +634,7 @@ export default function Page() {
         setTtsLang(saved.ttsLang);
       }
       if (saved.role === "teacher" || saved.role === "student") setRole(saved.role);
+      if (typeof saved.studentName === "string") setStudentName(saved.studentName);
       // First visit (or never completed setup) → show the onboarding overlay.
       if (!saved.onboarded) {
         setOnboarded(false);
@@ -635,12 +651,12 @@ export default function Page() {
   useEffect(() => {
     if (!settingsLoadedRef.current) return; // don't clobber stored values before load runs
     try {
-      const settings: StoredSettings = { tab, scale, contrast, dyslexia, rate, ttsLang, role, onboarded };
+      const settings: StoredSettings = { tab, scale, contrast, dyslexia, rate, ttsLang, role, onboarded, studentName };
       window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
     } catch {
       /* ignore unavailable storage (e.g. private mode) */
     }
-  }, [tab, scale, contrast, dyslexia, rate, ttsLang, role, onboarded]);
+  }, [tab, scale, contrast, dyslexia, rate, ttsLang, role, onboarded, studentName]);
 
   // ---- global keyboard shortcuts ----
   useEffect(() => {
@@ -745,15 +761,6 @@ export default function Page() {
   const fontPct = Math.round(scale * 100);
   const notSpeaking = !speaking;
   const connected = wsStatus === "connected";
-  const capStatus = capActive
-    ? "Broadcasting…"
-    : connected
-    ? role === "teacher"
-      ? "Class open"
-      : "Listening to class"
-    : wsStatus === "connecting"
-    ? "Connecting…"
-    : "Idle";
   const capStatusColor = capActive
     ? "var(--red,#c62026)"
     : connected
@@ -1404,119 +1411,191 @@ export default function Page() {
                 CC
               </span>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={S.eyebrow}>For deaf &amp; hard-of-hearing learners</div>
-                <h2 style={S.h2}>Live Class Captions</h2>
+                <div style={S.eyebrow}>{role === "teacher" ? "Teacher · run your class" : "For deaf & hard-of-hearing learners"}</div>
+                <h2 style={S.h2}>{role === "teacher" ? "Broadcast Live Captions" : "Live Class Captions"}</h2>
                 <p style={S.lead}>
-                  The teacher broadcasts live captions from their device; everyone who joins the same class code sees them appear in real time, in large high-contrast text.
+                  {role === "teacher"
+                    ? "Create a class, start speaking, and your words are captioned on your device and streamed live to every student who joins — while you watch them arrive."
+                    : "Join your teacher's class with the code they share, and their words appear live in large, high-contrast text."}
                 </p>
               </div>
-            </div>
-
-            {/* role (chosen at setup) + class code */}
-            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 12, marginBottom: 14 }}>
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 8, fontSize: ".9em", fontWeight: 700, color: "var(--text)", background: "var(--chip)", border: "1.5px solid var(--border)", borderRadius: 12, padding: "8px 14px" }}>
-                {role === "teacher" ? "🎤 Teacher" : "🎧 Student"}
-                {!connected && !capActive && (
-                  <button
-                    type="button"
-                    onClick={() => setShowOnboarding(true)}
-                    style={{ border: "none", background: "transparent", color: "var(--blue,#0b2e6b)", fontWeight: 700, fontSize: ".92em", cursor: "pointer", padding: 0, textDecoration: "underline" }}
-                  >
-                    change
-                  </button>
-                )}
-              </span>
-              <label htmlFor="roomcode" style={{ fontSize: ".86em", fontWeight: 700, color: "var(--muted)" }}>
-                Class code
-              </label>
-              <input
-                id="roomcode"
-                value={room}
-                onChange={(e) => setRoom(e.target.value)}
+              <button
+                type="button"
+                onClick={() => setShowOnboarding(true)}
                 disabled={connected || capActive}
-                aria-label="Class code"
-                style={{ ...S.input, width: 130 }}
-              />
-              <div style={{ display: "flex", alignItems: "center", gap: 9, marginLeft: "auto", fontSize: ".9em", fontWeight: 700, color: capStatusColor }}>
-                <span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: "50%", background: capStatusColor }} />
-                {capStatus}
-                {connected && (
-                  <span style={{ color: "var(--muted)", fontWeight: 600 }}>
-                    · {role === "teacher" ? `${peers} listening` : `${peers} other${peers === 1 ? "" : "s"}`}
-                  </span>
-                )}
-              </div>
-            </div>
-
-            {/* actions */}
-            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 12, marginBottom: 14 }}>
-              {role === "teacher" ? (
-                <button
-                  type="button"
-                  onClick={capActive ? stopBroadcast : startBroadcast}
-                  disabled={!capSupported || wsStatus === "connecting"}
-                  style={{ ...S.btnPrimary, background: capActive ? "var(--red,#c62026)" : undefined, opacity: !capSupported ? 0.5 : 1 }}
-                >
-                  {capActive ? "■ Stop broadcasting" : "🔴 Start broadcasting"}
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={connected ? leaveClass : joinClass}
-                  disabled={wsStatus === "connecting"}
-                  style={{ ...S.btnPrimary, background: connected ? "var(--red,#c62026)" : undefined }}
-                >
-                  {connected ? "■ Leave class" : "▶ Join class"}
-                </button>
-              )}
-              <button type="button" onClick={clearCap} style={S.btnGhost}>
-                Clear
+                style={{ ...S.btnGhost, padding: "8px 12px", fontSize: ".82em", opacity: connected || capActive ? 0.5 : 1 }}
+              >
+                {role === "teacher" ? "🎤 Teacher" : "🎧 Student"} · change
               </button>
             </div>
 
-            <p style={{ margin: "0 0 16px", fontSize: ".88em", color: "var(--muted)", lineHeight: 1.5, maxWidth: 660 }}>
-              {role === "teacher" ? (
-                <>
-                  Your speech is transcribed on your device and sent live to every student on class code{" "}
-                  <strong style={{ color: "var(--text)" }}>{room || "…"}</strong>. Share that code so they can join.
-                </>
-              ) : (
-                <>
-                  Enter the class code your teacher shared, then press{" "}
-                  <strong style={{ color: "var(--text)" }}>Join class</strong> to see their captions appear live.
-                </>
-              )}
-            </p>
+            {role === "teacher" ? (
+              /* ===================== TEACHER VIEW ===================== */
+              <>
+                {/* class code + status */}
+                <div style={{ display: "flex", flexWrap: "wrap", alignItems: "flex-end", gap: 14, marginBottom: 16 }}>
+                  <div>
+                    <label htmlFor="roomcode" style={{ ...S.label, marginBottom: 6 }}>
+                      Class code (share with students)
+                    </label>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <input
+                        id="roomcode"
+                        value={room}
+                        onChange={(e) => setRoom(e.target.value.toUpperCase())}
+                        disabled={connected || capActive}
+                        aria-label="Class code"
+                        style={{ ...S.input, width: 150, fontSize: "1.1em", letterSpacing: ".06em" }}
+                      />
+                      <button
+                        type="button"
+                        onClick={newClassCode}
+                        disabled={connected || capActive}
+                        style={{ ...S.btnGhost, padding: "9px 14px", opacity: connected || capActive ? 0.5 : 1 }}
+                      >
+                        ♺ New code
+                      </button>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 9, marginLeft: "auto", fontSize: ".9em", fontWeight: 700, color: capStatusColor }}>
+                    <span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: "50%", background: capStatusColor }} />
+                    {capActive ? "Class is LIVE" : connected ? "Class open" : "Not started"}
+                  </div>
+                </div>
 
-            {!capSupported && role === "teacher" && (
-              <div role="note" style={{ background: "var(--chip)", border: "1px solid var(--border)", borderRadius: 12, padding: "12px 16px", fontSize: ".88em", color: "var(--text)", marginBottom: 16 }}>
-                Broadcasting needs on-device speech recognition — use <strong>Chrome or Edge on desktop</strong>. Students can join and view captions in any browser.
-              </div>
-            )}
+                {/* start / stop / clear */}
+                <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 12, marginBottom: 18 }}>
+                  <button
+                    type="button"
+                    onClick={capActive ? stopBroadcast : startBroadcast}
+                    disabled={!capSupported || wsStatus === "connecting"}
+                    style={{ ...S.btnPrimary, background: capActive ? "var(--red,#c62026)" : undefined, opacity: !capSupported ? 0.5 : 1 }}
+                  >
+                    {capActive ? "■ End class" : "🔴 Start class"}
+                  </button>
+                  <button type="button" onClick={clearCap} disabled={!capActive} style={{ ...S.btnGhost, opacity: capActive ? 1 : 0.5 }}>
+                    Clear captions
+                  </button>
+                </div>
 
-            {/* caption display */}
-            <div aria-live="assertive" style={{ minHeight: 160, background: "#05132e", border: "1px solid var(--border)", borderRadius: 16, padding: "24px 30px", display: "flex", alignItems: "center" }}>
-              <p style={{ margin: 0, fontFamily: "var(--display)", fontWeight: 600, fontSize: "2.1em", lineHeight: 1.3, color: "#ffffff" }}>
-                {capFinal ? <span>{capFinal} </span> : null}
-                {capInterim ? <span style={{ color: "#9fc0ff" }}>{capInterim}</span> : null}
-                {!capFinal && !capInterim && (
-                  <span style={{ color: "#5b78b8" }}>
-                    {role === "teacher" ? (
-                      <>
-                        Press <strong style={{ color: "#9fc0ff" }}>Start broadcasting</strong> and begin speaking…
-                      </>
+                {!capSupported && (
+                  <div role="note" style={{ background: "var(--chip)", border: "1px solid var(--border)", borderRadius: 12, padding: "12px 16px", fontSize: ".88em", color: "var(--text)", marginBottom: 16 }}>
+                    Broadcasting needs on-device speech recognition — use <strong>Chrome or Edge on desktop</strong>. Students can join in any browser.
+                  </div>
+                )}
+
+                {/* roster + live caption preview */}
+                <div style={{ display: "grid", gridTemplateColumns: "minmax(220px, 1fr) minmax(0, 2fr)", gap: 16, alignItems: "stretch" }}>
+                  {/* roster */}
+                  <div style={{ background: "var(--chip)", border: "1px solid var(--border)", borderRadius: 16, padding: "18px 18px" }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                      <span style={{ fontFamily: "var(--display)", fontWeight: 700, fontSize: "1.02em", color: "var(--text)" }}>
+                        Students
+                      </span>
+                      <span style={{ fontSize: ".78em", fontWeight: 800, color: "#fff", background: "var(--blue,#0b2e6b)", borderRadius: 999, padding: "3px 10px" }}>
+                        {peers}
+                      </span>
+                    </div>
+                    {roster.length === 0 ? (
+                      <p style={{ margin: 0, fontSize: ".86em", color: "var(--muted)", lineHeight: 1.5 }}>
+                        No students yet. Share the code{" "}
+                        <strong style={{ color: "var(--text)" }}>{room || "…"}</strong> so they can join.
+                      </p>
                     ) : (
-                      <>
-                        Press <strong style={{ color: "#9fc0ff" }}>Join class</strong> to see live captions…
-                      </>
+                      <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 8 }}>
+                        {roster.map((name, i) => (
+                          <li key={`${name}-${i}`} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: ".94em", fontWeight: 600, color: "var(--text)" }}>
+                            <span aria-hidden="true" style={{ width: 26, height: 26, borderRadius: "50%", background: "var(--blue,#0b2e6b)", color: "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: ".8em", fontWeight: 800, flex: "none" }}>
+                              {(name || "?").slice(0, 1).toUpperCase()}
+                            </span>
+                            {name}
+                          </li>
+                        ))}
+                      </ul>
                     )}
-                  </span>
-                )}
-                {(capActive || (connected && role === "student")) && (
-                  <span style={{ animation: "caret-blink 1s step-end infinite", color: "#9fc0ff" }}> ▌</span>
-                )}
-              </p>
-            </div>
+                  </div>
+
+                  {/* live caption preview (what students see) */}
+                  <div aria-live="polite" style={{ minHeight: 160, background: "#05132e", border: "1px solid var(--border)", borderRadius: 16, padding: "22px 26px", display: "flex", alignItems: "center" }}>
+                    <p style={{ margin: 0, fontFamily: "var(--display)", fontWeight: 600, fontSize: "1.7em", lineHeight: 1.35, color: "#ffffff" }}>
+                      {capFinal ? <span>{capFinal} </span> : null}
+                      {capInterim ? <span style={{ color: "#9fc0ff" }}>{capInterim}</span> : null}
+                      {!capFinal && !capInterim && (
+                        <span style={{ color: "#5b78b8", fontSize: ".8em" }}>
+                          Press <strong style={{ color: "#9fc0ff" }}>Start class</strong> and begin speaking — your students see this live.
+                        </span>
+                      )}
+                      {capActive && <span style={{ animation: "caret-blink 1s step-end infinite", color: "#9fc0ff" }}> ▌</span>}
+                    </p>
+                  </div>
+                </div>
+              </>
+            ) : (
+              /* ===================== STUDENT VIEW ===================== */
+              <>
+                <div style={{ display: "flex", flexWrap: "wrap", alignItems: "flex-end", gap: 14, marginBottom: 16 }}>
+                  <div>
+                    <label htmlFor="studentname" style={{ ...S.label, marginBottom: 6 }}>
+                      Your name
+                    </label>
+                    <input
+                      id="studentname"
+                      value={studentName}
+                      onChange={(e) => setStudentName(e.target.value)}
+                      disabled={connected}
+                      placeholder="e.g. Shagato"
+                      aria-label="Your name"
+                      style={{ ...S.input, width: 180 }}
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="roomcode" style={{ ...S.label, marginBottom: 6 }}>
+                      Class code
+                    </label>
+                    <input
+                      id="roomcode"
+                      value={room}
+                      onChange={(e) => setRoom(e.target.value.toUpperCase())}
+                      disabled={connected}
+                      aria-label="Class code"
+                      style={{ ...S.input, width: 150, letterSpacing: ".06em" }}
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={connected ? leaveClass : joinClass}
+                    disabled={wsStatus === "connecting" || (!connected && !room.trim())}
+                    style={{ ...S.btnPrimary, background: connected ? "var(--red,#c62026)" : undefined }}
+                  >
+                    {connected ? "■ Leave class" : "▶ Join class"}
+                  </button>
+                  <div style={{ display: "flex", alignItems: "center", gap: 9, marginLeft: "auto", fontSize: ".9em", fontWeight: 700, color: capStatusColor }}>
+                    <span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: "50%", background: capStatusColor }} />
+                    {connected ? "In class" : wsStatus === "connecting" ? "Connecting…" : "Not joined"}
+                  </div>
+                </div>
+
+                {/* caption display */}
+                <div aria-live="assertive" style={{ minHeight: 180, background: "#05132e", border: "1px solid var(--border)", borderRadius: 16, padding: "26px 32px", display: "flex", alignItems: "center" }}>
+                  <p style={{ margin: 0, fontFamily: "var(--display)", fontWeight: 600, fontSize: "2.1em", lineHeight: 1.3, color: "#ffffff" }}>
+                    {capFinal ? <span>{capFinal} </span> : null}
+                    {capInterim ? <span style={{ color: "#9fc0ff" }}>{capInterim}</span> : null}
+                    {!capFinal && !capInterim && (
+                      <span style={{ color: "#5b78b8" }}>
+                        {connected ? (
+                          <>Waiting for your teacher to speak…</>
+                        ) : (
+                          <>
+                            Enter your teacher&apos;s code and press <strong style={{ color: "#9fc0ff" }}>Join class</strong>.
+                          </>
+                        )}
+                      </span>
+                    )}
+                    {connected && <span style={{ animation: "caret-blink 1s step-end infinite", color: "#9fc0ff" }}> ▌</span>}
+                  </p>
+                </div>
+              </>
+            )}
           </div>
         </section>
 
