@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as S from "./theme";
-import { API_BASE, describeImage, logUsage, simplify as apiSimplify, ttsSpeak } from "./lib/api";
+import { API_BASE, WS_BASE, describeImage, logUsage, simplify as apiSimplify, translate as apiTranslate, ttsSpeak } from "./lib/api";
+import Boxicon from "./components/Boxicon";
 
 type Tab = "read" | "simplify" | "captions";
 type Role = "teacher" | "student";
@@ -18,9 +19,10 @@ const LANGS: { code: Lang; label: string; bcp47: string; piper: boolean }[] = [
 ];
 const langInfo = (code: Lang) => LANGS.find((l) => l.code === code) ?? LANGS[0];
 
-// The captions WebSocket lives at the same host as the REST API.
+// The captions WebSocket base comes from NEXT_PUBLIC_WS_URL (falling back to the
+// REST host with http->ws); see resolveWsBase in lib/api.
 const wsUrlFor = (room: string) =>
-  `${API_BASE.replace(/^http/, "ws")}/ws/captions/${encodeURIComponent(room)}`;
+  `${WS_BASE}/ws/captions/${encodeURIComponent(room)}`;
 
 const SETTINGS_KEY = "inclusionai:settings";
 
@@ -36,19 +38,9 @@ type StoredSettings = {
   studentName: string;
 };
 
-// A tiny speaker icon reused throughout.
+// A tiny speaker icon reused throughout (boxicons volume-full).
 function Speaker() {
-  return (
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor" />
-      <path
-        d="M16.5 8.5a4 4 0 0 1 0 7M19 6a7.5 7.5 0 0 1 0 12"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
+  return <Boxicon name="volume-full" size={20} />;
 }
 
 export default function Page() {
@@ -75,6 +67,12 @@ export default function Page() {
   const [rate, setRate] = useState(1);
   const [ttsMsg, setTtsMsg] = useState("");
   const [ttsLang, setTtsLang] = useState<Lang>("en");
+  const [translating, setTranslating] = useState(false);
+  // The AI translation currently shown/read, and which language it is in.
+  const [shownTranslation, setShownTranslation] = useState<{ lang: Lang; text: string } | null>(null);
+  // Cache of translations keyed by language, remembering the source text they
+  // were made from so we skip the API when nothing changed ($5 OpenAI budget).
+  const translationCacheRef = useRef<Record<string, { src: string; out: string }>>({});
 
   // ---- simplify (F2) ----
   const [simpIn, setSimpIn] = useState(
@@ -96,6 +94,8 @@ export default function Page() {
   const [peers, setPeers] = useState(0);
   const [roster, setRoster] = useState<string[]>([]); // teacher: names of joined students
   const [studentName, setStudentName] = useState(""); // student: their display name
+  const [videoOn, setVideoOn] = useState(false); // teacher: camera broadcasting
+  const [videoLive, setVideoLive] = useState(false); // student: receiving teacher video
 
   // ---- refs ----
   const curTextRef = useRef("");
@@ -109,6 +109,15 @@ export default function Page() {
   const engineRef = useRef<"piper" | "browser" | null>(null);
   const speakSeqRef = useRef(0); // guards against overlapping async Piper requests
   const settingsLoadedRef = useRef(false); // don't persist until initial load runs
+  // ---- F3 live video refs ----
+  const localStreamRef = useRef<MediaStream | null>(null); // teacher camera+mic
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const teacherVideoRef = useRef<HTMLVideoElement | null>(null);
+  const studentVideoRef = useRef<HTMLVideoElement | null>(null);
+  const mediaSourceRef = useRef<MediaSource | null>(null);
+  const sourceBufferRef = useRef<SourceBuffer | null>(null);
+  const chunkQueueRef = useRef<ArrayBuffer[]>([]);
+  const liveRef = useRef(false); // teacher class is broadcasting (keeps captions alive)
 
   const announce = useCallback((msg: string) => {
     setAnnounceMsg("");
@@ -324,16 +333,72 @@ export default function Page() {
     setSpeaking(false);
     setPaused(false);
     pausedRef.current = false;
+    setTranslating(false);
     setTtsMsg("");
   }, [clearKeepAlive, stopAudio]);
 
-  const playRead = useCallback(() => {
+  const playRead = useCallback(async () => {
     if (speaking && paused) {
       pauseRead(); // resume
       return;
     }
-    speak(readText);
-  }, [speaking, paused, readText, speak, pauseRead]);
+    const text = readText;
+    if (!text.trim()) {
+      setTtsMsg("Add some text first, then press Read Aloud.");
+      return;
+    }
+    const target = ttsLang;
+    // English is the language the lesson text arrives in — read it as-is.
+    if (target === "en") {
+      setShownTranslation(null);
+      speak(text, "en");
+      return;
+    }
+
+    // Non-English: translate the text with the AI first, then read *that* aloud.
+    // Reading the English text with a Bangla/Malay voice would just be gibberish.
+    const seq = ++speakSeqRef.current; // supersedes any in-flight speech/translation
+    stopAudio();
+    utterRef.current = null;
+    clearKeepAlive();
+    const synth = typeof window !== "undefined" ? window.speechSynthesis : null;
+    if (synth) {
+      try {
+        synth.cancel();
+      } catch {
+        /* ignore */
+      }
+    }
+    setSpeaking(false);
+    setPaused(false);
+    pausedRef.current = false;
+
+    const label = langInfo(target).label;
+    const cached = translationCacheRef.current[target];
+    let translated: string;
+    if (cached && cached.src === text) {
+      translated = cached.out; // unchanged text → reuse, don't spend an API call
+    } else {
+      setTranslating(true);
+      setTtsMsg(`Translating to ${label}…`);
+      try {
+        translated = await apiTranslate(text, target);
+        logUsage("F1", "translate", { lang: target });
+      } catch {
+        setTranslating(false);
+        if (seq !== speakSeqRef.current) return; // superseded while awaiting
+        // Backend/AI unreachable → read the original text rather than nothing.
+        setTtsMsg("Translation unavailable — reading the original text.");
+        speak(text, target);
+        return;
+      }
+      setTranslating(false);
+      translationCacheRef.current[target] = { src: text, out: translated };
+    }
+    if (seq !== speakSeqRef.current) return; // language switched / stopped mid-translate
+    setShownTranslation({ lang: target, text: translated });
+    speak(translated, target);
+  }, [speaking, paused, readText, ttsLang, speak, pauseRead, stopAudio, clearKeepAlive]);
 
   const onRate = (e: React.ChangeEvent<HTMLInputElement>) => {
     const r = parseFloat(e.target.value);
@@ -352,9 +417,10 @@ export default function Page() {
     setImgDescBusy(true);
     setImgDescMsg("");
     try {
-      const description = await describeImage(dataUrl);
+      // Describe in the learner's selected language, not always English.
+      const description = await describeImage(dataUrl, ttsLang);
       setImgDesc(description);
-      logUsage("F1", "describe_image");
+      logUsage("F1", "describe_image", { lang: ttsLang });
     } catch {
       setImgDescMsg(
         "Could not reach the InclusionAI vision AI. Make sure the backend is running, then try again."
@@ -362,7 +428,7 @@ export default function Page() {
     } finally {
       setImgDescBusy(false);
     }
-  }, []);
+  }, [ttsLang]);
 
   const onImage = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files && e.target.files[0];
@@ -415,6 +481,85 @@ export default function Page() {
     setCapActive(false);
   }, []);
 
+  // ---- F3 video (student side): Media Source Extensions playback ----
+  const flushVideoQueue = useCallback(() => {
+    const sb = sourceBufferRef.current;
+    if (!sb || sb.updating) return;
+    const next = chunkQueueRef.current.shift();
+    if (!next) return;
+    try {
+      sb.appendBuffer(next);
+    } catch {
+      /* invalid state / quota — drop this chunk and keep going */
+    }
+  }, []);
+
+  const teardownStudentVideo = useCallback(() => {
+    chunkQueueRef.current = [];
+    sourceBufferRef.current = null;
+    const ms = mediaSourceRef.current;
+    mediaSourceRef.current = null;
+    try {
+      if (ms && ms.readyState === "open") ms.endOfStream();
+    } catch {
+      /* ignore */
+    }
+    const v = studentVideoRef.current;
+    if (v) {
+      try {
+        v.pause();
+        v.removeAttribute("src");
+        v.load();
+      } catch {
+        /* ignore */
+      }
+    }
+    setVideoLive(false);
+  }, []);
+
+  const setupStudentVideo = useCallback(
+    (mime: string) => {
+      teardownStudentVideo();
+      if (typeof MediaSource === "undefined" || !MediaSource.isTypeSupported(mime)) {
+        return; // browser can't play this stream (e.g. Safari + WebM)
+      }
+      const ms = new MediaSource();
+      mediaSourceRef.current = ms;
+      const v = studentVideoRef.current;
+      if (v) {
+        v.src = URL.createObjectURL(ms);
+        v.play().catch(() => {
+          /* autoplay may need a tap — the element has controls */
+        });
+      }
+      ms.addEventListener(
+        "sourceopen",
+        () => {
+          try {
+            const sb = ms.addSourceBuffer(mime);
+            sb.mode = "sequence";
+            sb.addEventListener("updateend", flushVideoQueue);
+            sourceBufferRef.current = sb;
+            flushVideoQueue();
+          } catch {
+            /* ignore */
+          }
+        },
+        { once: true }
+      );
+      setVideoLive(true);
+    },
+    [teardownStudentVideo, flushVideoQueue]
+  );
+
+  const appendVideoChunk = useCallback(
+    (buf: ArrayBuffer) => {
+      chunkQueueRef.current.push(buf);
+      flushVideoQueue();
+    },
+    [flushVideoQueue]
+  );
+
   // ---- captions (F3): close the live-captions WebSocket ----
   const closeWs = useCallback(() => {
     const ws = wsRef.current;
@@ -444,12 +589,18 @@ export default function Page() {
           reject(e);
           return;
         }
+        ws.binaryType = "arraybuffer";
         ws.onopen = () => {
           setWsStatus("connected");
           ws.send(JSON.stringify({ type: "hello", role: identityRole, name }));
           resolve(ws);
         };
         ws.onmessage = (ev) => {
+          // Binary frames are teacher video chunks (students only).
+          if (ev.data instanceof ArrayBuffer) {
+            appendVideoChunk(ev.data);
+            return;
+          }
           let msg: any;
           try {
             msg = JSON.parse(ev.data);
@@ -460,6 +611,10 @@ export default function Page() {
             // Teacher's live list of joined students.
             setRoster(Array.isArray(msg.students) ? msg.students : []);
             setPeers(typeof msg.count === "number" ? msg.count : 0);
+          } else if (msg.type === "video_start") {
+            setupStudentVideo(String(msg.mime || "video/webm"));
+          } else if (msg.type === "video_stop") {
+            teardownStudentVideo();
           } else if (msg.type === "caption") {
             // Incoming caption from the teacher (students only receive these).
             if (msg.final) {
@@ -480,17 +635,57 @@ export default function Page() {
           setWsStatus("idle");
           setPeers(0);
           setRoster([]);
+          teardownStudentVideo();
         };
         wsRef.current = ws;
       }),
-    []
+    [appendVideoChunk, setupStudentVideo, teardownStudentVideo]
   );
 
-  // ---- teacher: broadcast live captions (mic → WebSocket → students) ----
+  // ---- teacher: broadcast camera + mic + captions to students ----
   const stopBroadcast = useCallback(() => {
+    liveRef.current = false;
+    // stop video capture
+    const recr = recorderRef.current;
+    if (recr) {
+      try {
+        recr.ondataavailable = null;
+        if (recr.state !== "inactive") recr.stop();
+      } catch {
+        /* ignore */
+      }
+      recorderRef.current = null;
+    }
+    const stream = localStreamRef.current;
+    if (stream) {
+      stream.getTracks().forEach((t) => {
+        try {
+          t.stop();
+        } catch {
+          /* ignore */
+        }
+      });
+      localStreamRef.current = null;
+    }
+    if (teacherVideoRef.current) {
+      try {
+        teacherVideoRef.current.srcObject = null;
+      } catch {
+        /* ignore */
+      }
+    }
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ type: "video_stop" }));
+      } catch {
+        /* ignore */
+      }
+    }
+    setVideoOn(false);
     stopRec();
     closeWs();
-    announce("Stopped broadcasting captions.");
+    announce("Ended the class.");
   }, [stopRec, closeWs, announce]);
 
   const startBroadcast = useCallback(async () => {
@@ -498,10 +693,6 @@ export default function Page() {
       (typeof window !== "undefined" &&
         ((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition)) ||
       null;
-    if (!SR) {
-      setCapSupported(false);
-      return;
-    }
     let ws: WebSocket;
     try {
       ws = await connectWs(room, "teacher", "Teacher");
@@ -510,38 +701,83 @@ export default function Page() {
       announce("Could not connect to the class. Is the backend running?");
       return;
     }
-    const rec = new SR();
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.lang = "en-US";
-    rec.onresult = (event: any) => {
-      let interim = "";
-      let finalAdd = "";
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const r = event.results[i];
-        if (r.isFinal) finalAdd += r[0].transcript;
-        else interim += r[0].transcript;
+    liveRef.current = true;
+
+    // --- camera + mic → MediaRecorder → WebSocket ---
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStreamRef.current = stream;
+      if (teacherVideoRef.current) {
+        teacherVideoRef.current.srcObject = stream;
+        teacherVideoRef.current.muted = true; // avoid the teacher hearing themselves
+        teacherVideoRef.current.play().catch(() => {});
       }
-      const send = (final: boolean, text: string) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "caption", final, text }));
-        }
+      const candidates = ["video/webm;codecs=vp8,opus", "video/webm;codecs=vp9,opus", "video/webm"];
+      const mime =
+        (typeof MediaRecorder !== "undefined" && candidates.find((m) => MediaRecorder.isTypeSupported(m))) || "";
+      if (mime) {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "video_start", mime }));
+        const recr = new MediaRecorder(stream, { mimeType: mime });
+        recr.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0 && ws.readyState === WebSocket.OPEN) ws.send(e.data);
+        };
+        recr.start(500); // emit a ~500ms chunk stream
+        recorderRef.current = recr;
+        setVideoOn(true);
+      }
+    } catch {
+      announce("Camera or microphone unavailable — broadcasting captions only.");
+    }
+
+    // --- on-device captions via SpeechRecognition ---
+    if (SR) {
+      setCapSupported(true);
+      const startRec = () => {
+        const rec = new SR();
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.lang = "en-US";
+        rec.onresult = (event: any) => {
+          let interim = "";
+          let finalAdd = "";
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const r = event.results[i];
+            if (r.isFinal) finalAdd += r[0].transcript;
+            else interim += r[0].transcript;
+          }
+          const send = (final: boolean, text: string) => {
+            if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "caption", final, text }));
+          };
+          if (finalAdd) {
+            const clean = finalAdd.trim();
+            setCapFinal((prev) => (prev ? prev + " " : "") + clean);
+            send(true, clean);
+          }
+          setCapInterim(interim);
+          if (interim) send(false, interim);
+        };
+        rec.onerror = () => stopBroadcast();
+        // SpeechRecognition auto-ends on pauses — restart it while the class is live.
+        rec.onend = () => {
+          if (liveRef.current && recognitionRef.current === rec) {
+            try {
+              rec.start();
+            } catch {
+              /* ignore */
+            }
+          }
+        };
+        recognitionRef.current = rec;
+        rec.start();
       };
-      if (finalAdd) {
-        const clean = finalAdd.trim();
-        setCapFinal((prev) => (prev ? prev + " " : "") + clean);
-        send(true, clean);
-      }
-      setCapInterim(interim);
-      if (interim) send(false, interim);
-    };
-    rec.onerror = () => stopBroadcast();
-    rec.onend = () => setCapActive(false);
-    recognitionRef.current = rec;
-    rec.start();
+      startRec();
+    } else {
+      setCapSupported(false);
+    }
+
     setCapActive(true);
-    announce("Class is live. Broadcasting captions to your students.");
-    logUsage("F3", "broadcast_start", { room });
+    announce("Class is live. Streaming your camera and captions to students.");
+    logUsage("F3", "broadcast_start", { room, video: !!recorderRef.current });
   }, [connectWs, room, announce, stopBroadcast]);
 
   // Generate a fresh, human-friendly class code (teacher "create class").
@@ -737,6 +973,21 @@ export default function Page() {
         URL.revokeObjectURL(audioUrlRef.current);
         audioUrlRef.current = null;
       }
+      // stop live video capture
+      try {
+        recorderRef.current && recorderRef.current.state !== "inactive" && recorderRef.current.stop();
+      } catch {
+        /* ignore */
+      }
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((t) => {
+          try {
+            t.stop();
+          } catch {
+            /* ignore */
+          }
+        });
+      }
       const rec = recognitionRef.current;
       if (rec) {
         try {
@@ -831,7 +1082,7 @@ export default function Page() {
                 boxShadow: "0 24px 60px rgba(5,12,30,.4)",
               }}
             >
-              <div style={S.themePill}>★ Welcome to InclusionAI</div>
+              <div style={S.themePill}><Boxicon name="star" size={13} /> Welcome to InclusionAI</div>
               <h2 id="onboard-title" style={{ ...S.h2, marginTop: 14 }}>
                 Let&apos;s set up your Learning Companion
               </h2>
@@ -864,8 +1115,8 @@ export default function Page() {
                     }}
                   >
                     {l.label}
-                    <span style={{ fontSize: ".74em", fontWeight: 600, opacity: 0.8 }}>
-                      {l.piper ? "✨ neural voice" : "🔊 browser voice"}
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: ".74em", fontWeight: 600, opacity: 0.8 }}>
+                      {l.piper ? <><Boxicon name="sparkles" size={12} /> neural voice</> : <><Boxicon name="volume-full" size={12} /> browser voice</>}
                     </span>
                   </button>
                 ))}
@@ -891,13 +1142,15 @@ export default function Page() {
                       cursor: "pointer",
                     }}
                   >
-                    {r === "teacher" ? "🎤 Teacher" : "🎧 Student"}
+                    <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 7 }}>
+                      {r === "teacher" ? <><Boxicon name="microphone" size={17} /> Teacher</> : <><Boxicon name="headphone" size={17} /> Student</>}
+                    </span>
                   </button>
                 ))}
               </div>
 
               <button type="button" onClick={completeOnboarding} style={{ ...S.btnPrimary, width: "100%", justifyContent: "center" }}>
-                Start learning →
+                Start learning <Boxicon name="arrow-right" size={16} />
               </button>
             </div>
           </div>
@@ -916,15 +1169,10 @@ export default function Page() {
             }}
           >
             <div style={{ maxWidth: 640 }}>
-              <div style={S.themePill}>★ Where Young Minds Meet AI · STEM Competition</div>
+              <div style={S.themePill}><Boxicon name="star" size={13} /> Where Young Minds Meet AI · STEM Competition</div>
               <div style={{ display: "flex", alignItems: "center", gap: 15, marginTop: 17 }}>
                 <span aria-hidden="true" style={S.heroLogo}>
-                  <svg width="30" height="30" viewBox="0 0 24 24" fill="none">
-                    <path
-                      d="M12 3l2.2 5.1L20 9l-4 3.6L17.2 20 12 16.9 6.8 20 8 12.6 4 9l5.8-.9L12 3z"
-                      fill="#ff7a7e"
-                    />
-                  </svg>
+                  <Boxicon name="star" size={30} style={{ color: "#ff7a7e" }} />
                 </span>
                 <div>
                   <h1
@@ -971,8 +1219,8 @@ export default function Page() {
                 />
                 Read-aloud &amp; captions on-device
               </div>
-              <div style={S.heroBadge}>🛡️ WCAG 2.1 AA target</div>
-              <div style={S.heroBadge}>✨ AI-powered simplify &amp; vision</div>
+              <div style={S.heroBadge}><Boxicon name="shield" size={16} /> WCAG 2.1 AA target</div>
+              <div style={S.heroBadge}><Boxicon name="sparkles" size={16} /> AI-powered simplify &amp; vision</div>
             </div>
           </div>
         </header>
@@ -1057,10 +1305,10 @@ export default function Page() {
             Listen to guide
           </button>
           <button type="button" aria-expanded={showKeys} onClick={() => setShowKeys((v) => !v)} style={{ ...S.btnGhost, padding: "9px 14px" }}>
-            ⌨ Shortcuts
+            <Boxicon name="keyboard" size={18} /> Shortcuts
           </button>
           <button type="button" onClick={() => setShowOnboarding(true)} style={{ ...S.btnGhost, padding: "9px 14px" }}>
-            ⚙ Language &amp; role
+            <Boxicon name="cog" size={18} /> Language &amp; role
           </button>
         </div>
 
@@ -1147,14 +1395,14 @@ export default function Page() {
             </span>
           </button>
           <button type="button" role="tab" aria-selected={tab === "simplify"} onClick={() => setTab("simplify")} style={tabStyle(tab === "simplify")}>
-            <span aria-hidden="true" style={{ fontWeight: 800 }}>✦</span>
+            <Boxicon name="sparkles" size={20} />
             <span style={{ display: "flex", flexDirection: "column", gap: 2 }}>
               <span style={{ fontWeight: 700, fontSize: "1.02em" }}>Simplify-This</span>
               <span style={{ fontSize: ".78em", fontWeight: 600, opacity: 0.72 }}>Dyslexia, autism &amp; more</span>
             </span>
           </button>
           <button type="button" role="tab" aria-selected={tab === "captions"} onClick={() => setTab("captions")} style={tabStyle(tab === "captions")}>
-            <span aria-hidden="true" style={{ fontWeight: 800 }}>CC</span>
+            <Boxicon name="captions" size={20} />
             <span style={{ display: "flex", flexDirection: "column", gap: 2 }}>
               <span style={{ fontWeight: 700, fontSize: "1.02em" }}>Live Captions</span>
               <span style={{ fontSize: ".78em", fontWeight: 600, opacity: 0.72 }}>Deaf &amp; hard-of-hearing</span>
@@ -1173,14 +1421,23 @@ export default function Page() {
                 <div style={S.eyebrow}>For blind &amp; low-vision learners</div>
                 <h2 style={S.h2}>Read-to-Me</h2>
                 <p style={S.lead}>
-                  Have any text read aloud in English or Bangla with natural Piper neural voices — or Bahasa Malaysia via your browser — at an adjustable speed. Pause and resume anytime.
+                  Have any text read aloud in English or Bangla with natural Piper neural voices — or Bahasa Malaysia via your browser — at an adjustable speed. Pick a language other than English and the AI translates the lesson first, then reads it aloud. Pause and resume anytime.
                 </p>
               </div>
             </div>
             <label htmlFor="readbox" style={S.label}>
               Lesson text (from the class stream)
             </label>
-            <textarea id="readbox" value={readText} onChange={(e) => setReadText(e.target.value)} rows={5} style={S.textarea} />
+            <textarea
+              id="readbox"
+              value={readText}
+              onChange={(e) => {
+                setReadText(e.target.value);
+                setShownTranslation(null); // edited text → the old translation is stale
+              }}
+              rows={5}
+              style={S.textarea}
+            />
 
             {/* voice language picker */}
             <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, marginTop: 16 }}>
@@ -1193,6 +1450,7 @@ export default function Page() {
                     aria-pressed={ttsLang === l.code}
                     onClick={() => {
                       setTtsLang(l.code);
+                      setShownTranslation(null);
                       stopRead();
                     }}
                     style={{
@@ -1210,15 +1468,41 @@ export default function Page() {
                   </button>
                 ))}
               </div>
-              <span style={{ fontSize: ".78em", fontWeight: 600, color: "var(--muted)" }}>
-                {langInfo(ttsLang).piper ? "✨ Piper neural voice" : "🔊 Browser voice"}
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: ".78em", fontWeight: 600, color: "var(--muted)" }}>
+                {langInfo(ttsLang).piper ? <><Boxicon name="sparkles" size={13} /> Piper neural voice</> : <><Boxicon name="volume-full" size={13} /> Browser voice</>}
+                {ttsLang !== "en" && <> · <Boxicon name="globe" size={13} /> AI-translated</>}
               </span>
             </div>
 
+            {/* AI translation shown for non-English languages */}
+            {shownTranslation && shownTranslation.lang === ttsLang && (
+              <div
+                style={{
+                  marginTop: 14,
+                  padding: "12px 14px",
+                  borderRadius: 12,
+                  border: "1.5px solid var(--border)",
+                  background: "var(--card-alt,rgba(11,46,107,0.04))",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: ".78em", fontWeight: 700, color: "var(--muted)", marginBottom: 6 }}>
+                  <Boxicon name="globe" size={13} /> {`${langInfo(shownTranslation.lang).label} translation (read aloud)`}
+                </div>
+                <div lang={langInfo(shownTranslation.lang).bcp47} style={{ fontSize: "1em", lineHeight: 1.6 }}>
+                  {shownTranslation.text}
+                </div>
+              </div>
+            )}
+
             <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 12, marginTop: 14 }}>
-              <button type="button" onClick={playRead} style={S.btnPrimary}>
+              <button
+                type="button"
+                onClick={playRead}
+                disabled={translating}
+                style={{ ...S.btnPrimary, opacity: translating ? 0.6 : 1, cursor: translating ? "wait" : "pointer" }}
+              >
                 <Speaker />
-                {speaking && !paused ? "Reading…" : "Read Aloud"}
+                {translating ? "Translating…" : speaking && !paused ? "Reading…" : "Read Aloud"}
               </button>
               <button type="button" onClick={pauseRead} disabled={notSpeaking} style={{ ...S.btnGhost, opacity: notSpeaking ? 0.5 : 1 }}>
                 {paused ? "Resume" : "Pause"}
@@ -1246,7 +1530,7 @@ export default function Page() {
           <div style={S.card}>
             <div style={S.cardHead}>
               <span aria-hidden="true" style={S.iconChip}>
-                🖼️
+                <Boxicon name="image" size={24} />
               </span>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={S.eyebrow}>Image explainer</div>
@@ -1292,7 +1576,7 @@ export default function Page() {
                       justifyContent: "center",
                     }}
                   >
-                    ⬆
+                    <Boxicon name="arrow-up" size={24} />
                   </span>
                   <span style={{ fontWeight: 700, fontSize: ".96em" }}>Click to upload an image</span>
                   <span style={{ fontSize: ".82em", color: "var(--muted)" }}>
@@ -1342,7 +1626,7 @@ export default function Page() {
           <div style={S.card}>
             <div style={S.cardHead}>
               <span aria-hidden="true" style={S.iconChip}>
-                ✦
+                <Boxicon name="sparkles" size={24} />
               </span>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={S.eyebrow}>For dyslexia, autism &amp; slow-reading learners</div>
@@ -1358,7 +1642,7 @@ export default function Page() {
             <textarea id="simpin" value={simpIn} onChange={(e) => setSimpIn(e.target.value)} rows={5} style={S.textarea} />
             <div style={{ marginTop: 16 }}>
               <button type="button" onClick={doSimplify} disabled={simpBusy} style={{ ...S.btnPrimary, opacity: simpBusy ? 0.6 : 1 }}>
-                ✦ {simpBusy ? "Simplifying…" : "Simplify"}
+                <Boxicon name="sparkles" size={16} /> {simpBusy ? "Simplifying…" : "Simplify"}
               </button>
             </div>
 
@@ -1370,8 +1654,8 @@ export default function Page() {
                     <div style={{ display: "flex", alignItems: "center", gap: 10, marginLeft: "auto", fontSize: ".84em", fontWeight: 700 }}>
                       <span style={{ color: "var(--muted)" }}>Reading level</span>
                       <span style={S.gradeChip("before")}>Grade {levelBefore}</span>
-                      <span aria-hidden="true" style={{ color: "var(--muted)" }}>
-                        →
+                      <span aria-hidden="true" style={{ color: "var(--muted)", display: "inline-flex" }}>
+                        <Boxicon name="arrow-right" size={15} />
                       </span>
                       <span style={S.gradeChip("after")}>Grade {levelAfter}</span>
                     </div>
@@ -1412,11 +1696,11 @@ export default function Page() {
               </span>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={S.eyebrow}>{role === "teacher" ? "Teacher · run your class" : "For deaf & hard-of-hearing learners"}</div>
-                <h2 style={S.h2}>{role === "teacher" ? "Broadcast Live Captions" : "Live Class Captions"}</h2>
+                <h2 style={S.h2}>{role === "teacher" ? "Broadcast Your Live Class" : "Live Class"}</h2>
                 <p style={S.lead}>
                   {role === "teacher"
-                    ? "Create a class, start speaking, and your words are captioned on your device and streamed live to every student who joins — while you watch them arrive."
-                    : "Join your teacher's class with the code they share, and their words appear live in large, high-contrast text."}
+                    ? "Create a class and start — your camera, microphone, and live captions stream to every student who joins, while you watch them arrive."
+                    : "Join your teacher's class with the code they share to see their live video and captions in real time."}
                 </p>
               </div>
               <button
@@ -1425,7 +1709,7 @@ export default function Page() {
                 disabled={connected || capActive}
                 style={{ ...S.btnGhost, padding: "8px 12px", fontSize: ".82em", opacity: connected || capActive ? 0.5 : 1 }}
               >
-                {role === "teacher" ? "🎤 Teacher" : "🎧 Student"} · change
+                {role === "teacher" ? <><Boxicon name="microphone" size={15} /> Teacher</> : <><Boxicon name="headphone" size={15} /> Student</>} · change
               </button>
             </div>
 
@@ -1453,7 +1737,7 @@ export default function Page() {
                         disabled={connected || capActive}
                         style={{ ...S.btnGhost, padding: "9px 14px", opacity: connected || capActive ? 0.5 : 1 }}
                       >
-                        ♺ New code
+                        <Boxicon name="refresh" size={16} /> New code
                       </button>
                     </div>
                   </div>
@@ -1469,9 +1753,9 @@ export default function Page() {
                     type="button"
                     onClick={capActive ? stopBroadcast : startBroadcast}
                     disabled={!capSupported || wsStatus === "connecting"}
-                    style={{ ...S.btnPrimary, background: capActive ? "var(--red,#c62026)" : undefined, opacity: !capSupported ? 0.5 : 1 }}
+                    style={{ ...S.btnPrimary, ...(capActive ? { background: "var(--red,#c62026)" } : null), opacity: !capSupported ? 0.5 : 1 }}
                   >
-                    {capActive ? "■ End class" : "🔴 Start class"}
+                    {capActive ? <><Boxicon name="stop" size={15} /> End class</> : <><Boxicon name="circle" size={13} style={{ color: "var(--red,#c62026)" }} /> Start class</>}
                   </button>
                   <button type="button" onClick={clearCap} disabled={!capActive} style={{ ...S.btnGhost, opacity: capActive ? 1 : 0.5 }}>
                     Clear captions
@@ -1515,18 +1799,40 @@ export default function Page() {
                     )}
                   </div>
 
-                  {/* live caption preview (what students see) */}
-                  <div aria-live="polite" style={{ minHeight: 160, background: "#05132e", border: "1px solid var(--border)", borderRadius: 16, padding: "22px 26px", display: "flex", alignItems: "center" }}>
-                    <p style={{ margin: 0, fontFamily: "var(--display)", fontWeight: 600, fontSize: "1.7em", lineHeight: 1.35, color: "#ffffff" }}>
-                      {capFinal ? <span>{capFinal} </span> : null}
-                      {capInterim ? <span style={{ color: "#9fc0ff" }}>{capInterim}</span> : null}
-                      {!capFinal && !capInterim && (
-                        <span style={{ color: "#5b78b8", fontSize: ".8em" }}>
-                          Press <strong style={{ color: "#9fc0ff" }}>Start class</strong> and begin speaking — your students see this live.
+                  {/* teacher camera self-view + live caption preview */}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                    <div style={{ position: "relative", background: "#05132e", border: "1px solid var(--border)", borderRadius: 16, overflow: "hidden", aspectRatio: "16 / 9" }}>
+                      <video
+                        ref={teacherVideoRef}
+                        muted
+                        playsInline
+                        autoPlay
+                        style={{ width: "100%", height: "100%", objectFit: "cover", display: videoOn ? "block" : "none" }}
+                      />
+                      {!videoOn && (
+                        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#5b78b8", fontSize: ".9em", fontWeight: 600, textAlign: "center", padding: 16 }}>
+                          Your camera preview appears here when the class starts.
+                        </div>
+                      )}
+                      {videoOn && (
+                        <span style={{ position: "absolute", top: 10, left: 10, display: "inline-flex", alignItems: "center", gap: 6, fontSize: ".7em", fontWeight: 800, color: "#fff", background: "var(--red,#c62026)", padding: "4px 9px", borderRadius: 999 }}>
+                          <span aria-hidden="true" style={{ width: 6, height: 6, borderRadius: "50%", background: "#fff", animation: "rec-pulse 1.1s infinite" }} />
+                          ON AIR
                         </span>
                       )}
-                      {capActive && <span style={{ animation: "caret-blink 1s step-end infinite", color: "#9fc0ff" }}> ▌</span>}
-                    </p>
+                    </div>
+                    <div aria-live="polite" style={{ minHeight: 72, background: "#05132e", border: "1px solid var(--border)", borderRadius: 16, padding: "16px 22px", display: "flex", alignItems: "center" }}>
+                      <p style={{ margin: 0, fontFamily: "var(--display)", fontWeight: 600, fontSize: "1.4em", lineHeight: 1.35, color: "#ffffff" }}>
+                        {capFinal ? <span>{capFinal} </span> : null}
+                        {capInterim ? <span style={{ color: "#9fc0ff" }}>{capInterim}</span> : null}
+                        {!capFinal && !capInterim && (
+                          <span style={{ color: "#5b78b8", fontSize: ".8em" }}>
+                            Press <strong style={{ color: "#9fc0ff" }}>Start class</strong> — students see your captions here.
+                          </span>
+                        )}
+                        {capActive && <span style={{ animation: "caret-blink 1s step-end infinite", color: "#9fc0ff" }}> ▌</span>}
+                      </p>
+                    </div>
                   </div>
                 </div>
               </>
@@ -1565,9 +1871,9 @@ export default function Page() {
                     type="button"
                     onClick={connected ? leaveClass : joinClass}
                     disabled={wsStatus === "connecting" || (!connected && !room.trim())}
-                    style={{ ...S.btnPrimary, background: connected ? "var(--red,#c62026)" : undefined }}
+                    style={{ ...S.btnPrimary, ...(connected ? { background: "var(--red,#c62026)" } : null) }}
                   >
-                    {connected ? "■ Leave class" : "▶ Join class"}
+                    {connected ? <><Boxicon name="stop" size={15} /> Leave class</> : <><Boxicon name="play" size={15} /> Join class</>}
                   </button>
                   <div style={{ display: "flex", alignItems: "center", gap: 9, marginLeft: "auto", fontSize: ".9em", fontWeight: 700, color: capStatusColor }}>
                     <span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: "50%", background: capStatusColor }} />
@@ -1575,25 +1881,46 @@ export default function Page() {
                   </div>
                 </div>
 
-                {/* caption display */}
-                <div aria-live="assertive" style={{ minHeight: 180, background: "#05132e", border: "1px solid var(--border)", borderRadius: 16, padding: "26px 32px", display: "flex", alignItems: "center" }}>
-                  <p style={{ margin: 0, fontFamily: "var(--display)", fontWeight: 600, fontSize: "2.1em", lineHeight: 1.3, color: "#ffffff" }}>
-                    {capFinal ? <span>{capFinal} </span> : null}
-                    {capInterim ? <span style={{ color: "#9fc0ff" }}>{capInterim}</span> : null}
-                    {!capFinal && !capInterim && (
-                      <span style={{ color: "#5b78b8" }}>
-                        {connected ? (
-                          <>Waiting for your teacher to speak…</>
-                        ) : (
-                          <>
-                            Enter your teacher&apos;s code and press <strong style={{ color: "#9fc0ff" }}>Join class</strong>.
-                          </>
-                        )}
-                      </span>
-                    )}
-                    {connected && <span style={{ animation: "caret-blink 1s step-end infinite", color: "#9fc0ff" }}> ▌</span>}
-                  </p>
+                {/* teacher video (with caption overlay) — mounted always so the ref exists */}
+                <div style={{ position: "relative", background: "#000", border: "1px solid var(--border)", borderRadius: 16, overflow: "hidden", aspectRatio: "16 / 9", marginBottom: 16, display: videoLive ? "block" : "none" }}>
+                  <video
+                    ref={studentVideoRef}
+                    playsInline
+                    autoPlay
+                    controls
+                    style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
+                  />
+                  {(capFinal || capInterim) && (
+                    <div style={{ position: "absolute", left: 0, right: 0, bottom: 0, padding: "16px 20px", background: "linear-gradient(transparent, rgba(0,0,0,.78))", pointerEvents: "none" }}>
+                      <p aria-live="assertive" style={{ margin: 0, fontFamily: "var(--display)", fontWeight: 700, fontSize: "1.5em", lineHeight: 1.3, color: "#fff", textAlign: "center", textShadow: "0 1px 4px rgba(0,0,0,.9)" }}>
+                        {capFinal ? <span>{capFinal} </span> : null}
+                        {capInterim ? <span style={{ color: "#9fc0ff" }}>{capInterim}</span> : null}
+                      </p>
+                    </div>
+                  )}
                 </div>
+
+                {/* caption-only display when there is no video yet */}
+                {!videoLive && (
+                  <div aria-live="assertive" style={{ minHeight: 180, background: "#05132e", border: "1px solid var(--border)", borderRadius: 16, padding: "26px 32px", display: "flex", alignItems: "center" }}>
+                    <p style={{ margin: 0, fontFamily: "var(--display)", fontWeight: 600, fontSize: "2.1em", lineHeight: 1.3, color: "#ffffff" }}>
+                      {capFinal ? <span>{capFinal} </span> : null}
+                      {capInterim ? <span style={{ color: "#9fc0ff" }}>{capInterim}</span> : null}
+                      {!capFinal && !capInterim && (
+                        <span style={{ color: "#5b78b8" }}>
+                          {connected ? (
+                            <>Waiting for your teacher to start…</>
+                          ) : (
+                            <>
+                              Enter your teacher&apos;s code and press <strong style={{ color: "#9fc0ff" }}>Join class</strong>.
+                            </>
+                          )}
+                        </span>
+                      )}
+                      {connected && <span style={{ animation: "caret-blink 1s step-end infinite", color: "#9fc0ff" }}> ▌</span>}
+                    </p>
+                  </div>
+                )}
               </>
             )}
           </div>

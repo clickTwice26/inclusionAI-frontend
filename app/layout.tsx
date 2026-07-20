@@ -26,7 +26,10 @@ export default function RootLayout({
           rel="stylesheet"
         />
       </head>
-      <body>{children}</body>
+      {/* suppressHydrationWarning: browser extensions (ColorZilla's
+          cz-shortcut-listen, Grammarly, etc.) add attributes to <body> before
+          React hydrates, which harmlessly trips the hydration check. */}
+      <body suppressHydrationWarning>{children}</body>
     </html>
   );
 }

@@ -1,8 +1,31 @@
-// Client for the InclusionAI FastAPI backend.
-// The browser calls the host-published backend port, so this must be the
-// public URL (localhost:8000), NOT the docker-compose service name.
-export const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Base URL of the FastAPI backend, resolved in priority order:
+//   1. NEXT_PUBLIC_API_URL  — explicit override (set this in production).
+//   2. The host the page was loaded from, on port 8000 — so opening the app by
+//      LAN IP (e.g. http://192.168.0.109:3000 from a phone) automatically talks
+//      to http://192.168.0.109:8000 for both REST and the captions WebSocket.
+//   3. localhost:8000 — SSR fallback (no window yet).
+function resolveApiBase(): string {
+  const fromEnv = process.env.NEXT_PUBLIC_API_URL;
+  if (fromEnv) return fromEnv;
+  if (typeof window !== "undefined") {
+    return `${window.location.protocol}//${window.location.hostname}:8000`;
+  }
+  return "http://localhost:8000";
+}
+
+export const API_BASE = resolveApiBase();
+
+// Base URL of the captions WebSocket, resolved in priority order:
+//   1. NEXT_PUBLIC_WS_URL   — explicit override (e.g. ws://192.168.0.109:8000).
+//   2. Derived from API_BASE by swapping http->ws / https->wss.
+// wsUrlFor() appends "/ws/captions/<room>", so this must have no trailing path.
+function resolveWsBase(): string {
+  const fromEnv = process.env.NEXT_PUBLIC_WS_URL;
+  if (fromEnv) return fromEnv;
+  return API_BASE.replace(/^http/, "ws");
+}
+
+export const WS_BASE = resolveWsBase();
 
 export interface SimplifyResult {
   original: string;
@@ -35,11 +58,33 @@ export async function ttsSpeak(text: string, lang: string): Promise<string> {
   return URL.createObjectURL(blob);
 }
 
-export async function describeImage(imageDataUrl: string): Promise<string> {
+export interface TranslateResult {
+  original: string;
+  translated: string;
+  target_lang: string;
+}
+
+// Translate lesson text into another language via OpenAI on the backend, so the
+// Read-Aloud voice speaks real words in that language (not the English text).
+export async function translate(text: string, targetLang: string): Promise<string> {
+  const res = await fetch(`${API_BASE}/api/translate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, target_lang: targetLang }),
+  });
+  if (!res.ok) throw new Error(`Translate request failed (${res.status})`);
+  const data: TranslateResult = await res.json();
+  return data.translated;
+}
+
+// Describe an image via OpenAI vision on the backend. `lang` is the learner's
+// selected language short-code (en/bn/ms) so the description comes back in that
+// language rather than always English.
+export async function describeImage(imageDataUrl: string, lang = "en"): Promise<string> {
   const res = await fetch(`${API_BASE}/api/describe-image`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ image_data_url: imageDataUrl }),
+    body: JSON.stringify({ image_data_url: imageDataUrl, lang }),
   });
   if (!res.ok) throw new Error(`Describe-image request failed (${res.status})`);
   const data = await res.json();
