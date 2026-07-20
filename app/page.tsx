@@ -62,6 +62,10 @@ export default function Page() {
   const [imgDesc, setImgDesc] = useState("");
   const [imgDescBusy, setImgDescBusy] = useState(false);
   const [imgDescMsg, setImgDescMsg] = useState("");
+  // Cache of AI image descriptions keyed by language (remembering the image they
+  // were made from) so switching Voice language re-describes in that language
+  // without re-spending the OpenAI budget on a language already generated.
+  const imgDescCacheRef = useRef<Partial<Record<Lang, { src: string; out: string }>>>({});
   const [speaking, setSpeaking] = useState(false);
   const [paused, setPaused] = useState(false);
   const [rate, setRate] = useState(1);
@@ -413,21 +417,48 @@ export default function Page() {
   };
 
   // ---- image explainer (F1) — described by AI vision on the backend ----
-  const describeUploadedImage = useCallback(async (dataUrl: string) => {
-    setImgDescBusy(true);
-    setImgDescMsg("");
-    try {
-      // Describe in the learner's selected language, not always English.
-      const description = await describeImage(dataUrl, ttsLang);
-      setImgDesc(description);
-      logUsage("F1", "describe_image", { lang: ttsLang });
-    } catch {
-      setImgDescMsg(
-        "Could not reach the InclusionAI vision AI. Make sure the backend is running, then try again."
-      );
-    } finally {
-      setImgDescBusy(false);
+  const describeUploadedImage = useCallback(
+    async (dataUrl: string, lang: Lang = ttsLang, force = false) => {
+      // Reuse a cached description for this image+language unless forced.
+      if (!force) {
+        const cached = imgDescCacheRef.current[lang];
+        if (cached && cached.src === dataUrl) {
+          setImgDesc(cached.out);
+          setImgDescMsg("");
+          return;
+        }
+      }
+      setImgDescBusy(true);
+      setImgDescMsg("");
+      try {
+        // Describe in the learner's selected language, not always English.
+        const description = await describeImage(dataUrl, lang);
+        setImgDesc(description);
+        imgDescCacheRef.current[lang] = { src: dataUrl, out: description };
+        logUsage("F1", "describe_image", { lang });
+      } catch {
+        setImgDescMsg(
+          "Could not reach the InclusionAI vision AI. Make sure the backend is running, then try again."
+        );
+      } finally {
+        setImgDescBusy(false);
+      }
+    },
+    [ttsLang]
+  );
+
+  // When the learner switches Voice language and an image is already described,
+  // regenerate the description in the new language (served from cache if seen).
+  useEffect(() => {
+    if (!imgUrl || !imgDesc || imgDescBusy) return;
+    const cached = imgDescCacheRef.current[ttsLang];
+    if (cached && cached.src === imgUrl) {
+      if (cached.out !== imgDesc) setImgDesc(cached.out);
+    } else {
+      describeUploadedImage(imgUrl, ttsLang);
     }
+    // Only react to a language change; imgDesc/imgUrl are read from the closure.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ttsLang]);
 
   const onImage = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1612,7 +1643,7 @@ export default function Page() {
                     <Speaker />
                     Read description
                   </button>
-                  <button type="button" onClick={() => imgUrl && describeUploadedImage(imgUrl)} disabled={!imgUrl || imgDescBusy} style={{ ...S.btnGhost, opacity: !imgUrl || imgDescBusy ? 0.5 : 1 }}>
+                  <button type="button" onClick={() => imgUrl && describeUploadedImage(imgUrl, ttsLang, true)} disabled={!imgUrl || imgDescBusy} style={{ ...S.btnGhost, opacity: !imgUrl || imgDescBusy ? 0.5 : 1 }}>
                     {imgDescBusy ? "Describing…" : "Describe again"}
                   </button>
                 </div>
