@@ -1,0 +1,170 @@
+:root {
+  --blue: #0b2e6b;
+  --red: #c62026;
+  --border: #d7deef;
+  --card: #ffffff;
+  --muted: #586079;
+  --text: #141a2e;
+  --chip: #f2f5fb;
+  --bg: #eef2f9;
+  --focus: #c62026;
+  --display: "Space Grotesk", system-ui, sans-serif;
+  --body: "Lexend", system-ui, sans-serif;
+  --dys-font: "Atkinson Hyperlegible", "Lexend", sans-serif;
+}
+
+/* High-contrast mode (toggled via data-contrast on the app root).
+   Pure black-on-white: bold black borders, black secondary text,
+   black buttons, solid-black hero, and no soft shadows. */
+[data-contrast="true"] {
+  --bg: #ffffff;
+  --card: #ffffff;
+  --text: #000000;
+  --muted: #000000; /* secondary text goes fully black */
+  --border: #000000; /* crisp black outlines everywhere */
+  --chip: #ffffff;
+  --blue: #000000; /* buttons/tabs become black with white text */
+  --red: #b3000f; /* stronger red, AA on white */
+  --focus: #b3000f;
+}
+/* Flatten soft shadows so outlines carry the structure */
+[data-contrast="true"] * {
+  box-shadow: none !important;
+}
+/* The blue hero becomes solid black — an unmistakable on/off signal */
+[data-contrast="true"] header {
+  background: #000000 !important;
+}
+/* Thicker outlines on the key interactive surfaces */
+[data-contrast="true"] textarea,
+[data-contrast="true"] [role="tab"],
+[data-contrast="true"] [role="switch"],
+[data-contrast="true"] [role="region"] {
+  border-width: 2px !important;
+}
+
+/* Dyslexia-friendly font mode */
+[data-dyslexia="true"] {
+  --body: var(--dys-font);
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+}
+body {
+  font-family: var(--body);
+  color: var(--text);
+}
+button {
+  font: inherit;
+  cursor: pointer;
+  letter-spacing: inherit;
+}
+input,
+textarea,
+select {
+  font: inherit;
+  letter-spacing: inherit;
+}
+textarea {
+  line-height: 1.5;
+}
+:focus-visible {
+  outline: 3px solid var(--focus, #c62026);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+::selection {
+  background: var(--blue, #0b2e6b);
+  color: #fff;
+}
+a {
+  color: var(--red, #c62026);
+}
+a:hover {
+  color: var(--blue, #0b2e6b);
+}
+
+@keyframes rec-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.7); }
+}
+@keyframes bar-eq {
+  0%, 100% { transform: scaleY(0.35); }
+  50% { transform: scaleY(1); }
+}
+@keyframes caret-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--border, #d7deef);
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 8px;
+  border-radius: 999px;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 22px;
+  height: 22px;
+  margin-top: -7px;
+  border-radius: 50%;
+  background: var(--red, #c62026);
+  border: 3px solid var(--card, #fff);
+  box-shadow: 0 2px 7px rgba(11, 46, 107, 0.35);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  border: 3px solid var(--card, #fff);
+  border-radius: 50%;
+  background: var(--red, #c62026);
+}
+
+.skip-link {
+  position: absolute;
+  left: 16px;
+  top: -70px;
+  z-index: 100;
+  background: var(--blue, #0b2e6b);
+  color: #fff;
+  padding: 12px 18px;
+  border-radius: 12px;
+  font-weight: 700;
+  text-decoration: none;
+  transition: top 0.15s;
+}
+.skip-link:focus {
+  top: 16px;
+  color: #fff;
+}
+
+.uploader:focus-within {
+  outline: 3px solid var(--focus, #c62026);
+  outline-offset: 3px;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}

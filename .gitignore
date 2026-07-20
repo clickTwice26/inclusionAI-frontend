@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node / Next
+node_modules/
+.next/
+npm-debug.log*
+
+# Env
+.env
+*.local
+
+# Piper TTS voice models (large; downloaded via download command — see README)
+backend/piper_voices/
+
+# OS
+.DS_Store
