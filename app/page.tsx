@@ -2,13 +2,16 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as S from "./theme";
-import { API_BASE, WS_BASE, describeImage, logUsage, simplify as apiSimplify, translate as apiTranslate, ttsSpeak } from "./lib/api";
+import { API_BASE, WS_BASE, describeImage, illustrate as apiIllustrate, logUsage, simplify as apiSimplify, translate as apiTranslate, ttsSpeak } from "./lib/api";
 import Boxicon from "./components/Boxicon";
 
 type Tab = "read" | "simplify" | "captions";
 type Role = "teacher" | "student";
 type WsStatus = "idle" | "connecting" | "connected";
 type Lang = "en" | "bn" | "ms";
+// One finalized caption line in the live transcript. `tr` is its translation
+// into the student's language (filled in lazily when caption-translate is on).
+type Cap = { id: number; t: string; text: string; tr?: string };
 
 // Read-Aloud languages. `piper` ones are synthesized server-side by Piper;
 // the rest (and any Piper failure) use the browser's built-in speech synthesis.
@@ -18,6 +21,12 @@ const LANGS: { code: Lang; label: string; bcp47: string; piper: boolean }[] = [
   { code: "ms", label: "Bahasa Malaysia", bcp47: "ms-MY", piper: false },
 ];
 const langInfo = (code: Lang) => LANGS.find((l) => l.code === code) ?? LANGS[0];
+
+// Local wall-clock timestamp (HH:MM) for a transcript line.
+const nowHM = (): string => {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+};
 
 // The captions WebSocket base comes from NEXT_PUBLIC_WS_URL (falling back to the
 // REST host with http->ws); see resolveWsBase in lib/api.
@@ -41,6 +50,70 @@ type StoredSettings = {
 // A tiny speaker icon reused throughout (boxicons volume-full).
 function Speaker() {
   return <Boxicon name="volume-full" size={20} />;
+}
+
+// Scrollable live-transcript list: finalized caption lines (with timestamps)
+// plus the current in-progress line. Shows each line's translation when present.
+function LiveTranscript({
+  entries,
+  interim,
+  live,
+  boxRef,
+  emptyNode,
+  fontSize = "1.2em",
+  minHeight = 200,
+  maxHeight = 340,
+}: {
+  entries: Cap[];
+  interim: string;
+  live: boolean;
+  boxRef: React.RefObject<HTMLDivElement | null>;
+  emptyNode: React.ReactNode;
+  fontSize?: string;
+  minHeight?: number;
+  maxHeight?: number;
+}) {
+  const empty = entries.length === 0 && !interim;
+  return (
+    <div
+      ref={boxRef}
+      aria-live="polite"
+      style={{
+        minHeight,
+        maxHeight,
+        overflowY: "auto",
+        background: "#05132e",
+        border: "1px solid var(--border)",
+        borderRadius: 16,
+        padding: "18px 22px",
+        display: "flex",
+        flexDirection: "column",
+        gap: 10,
+      }}
+    >
+      {empty ? (
+        <div style={{ margin: "auto", color: "#5b78b8", fontSize: ".95em", fontWeight: 600, textAlign: "center" }}>{emptyNode}</div>
+      ) : (
+        <>
+          {entries.map((c) => (
+            <div key={c.id} style={{ display: "flex", gap: 12, alignItems: "baseline" }}>
+              <span aria-hidden="true" style={{ flex: "none", fontSize: ".68em", fontWeight: 700, color: "#5b78b8", fontVariantNumeric: "tabular-nums" }}>{c.t}</span>
+              <span style={{ fontFamily: "var(--display)", fontWeight: 600, fontSize, lineHeight: 1.4, color: "#ffffff" }}>{c.tr ?? c.text}</span>
+            </div>
+          ))}
+          {interim && (
+            <div style={{ display: "flex", gap: 12, alignItems: "baseline" }}>
+              <span aria-hidden="true" style={{ flex: "none", fontSize: ".68em", fontWeight: 700, color: "#3a4f7a" }}>···</span>
+              <span style={{ fontFamily: "var(--display)", fontWeight: 600, fontSize, lineHeight: 1.4, color: "#9fc0ff" }}>
+                {interim}
+                {live && <span style={{ animation: "caret-blink 1s step-end infinite" }}> ▌</span>}
+              </span>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
 }
 
 export default function Page() {
@@ -86,11 +159,16 @@ export default function Page() {
   const [levelBefore, setLevelBefore] = useState<number | null>(null);
   const [levelAfter, setLevelAfter] = useState<number | null>(null);
   const [simpBusy, setSimpBusy] = useState(false);
+  // F2 "learning picture" — an AI illustration of the simplified concept.
+  const [simpImg, setSimpImg] = useState("");
+  const [simpImgBusy, setSimpImgBusy] = useState(false);
+  const [simpImgMsg, setSimpImgMsg] = useState("");
 
   // ---- captions (F3): real teacher→students broadcast over a WebSocket ----
   const [capActive, setCapActive] = useState(false); // teacher microphone live
-  const [capFinal, setCapFinal] = useState("");
+  const [transcript, setTranscript] = useState<Cap[]>([]); // finalized caption lines
   const [capInterim, setCapInterim] = useState("");
+  const [capTranslate, setCapTranslate] = useState(false); // student: show captions in ttsLang
   const [capSupported, setCapSupported] = useState(true);
   const [role, setRole] = useState<Role>("teacher");
   const [room, setRoom] = useState("class-1");
@@ -114,7 +192,8 @@ export default function Page() {
   const speakSeqRef = useRef(0); // guards against overlapping async Piper requests
   const settingsLoadedRef = useRef(false); // don't persist until initial load runs
   // ---- F3 live video refs ----
-  const localStreamRef = useRef<MediaStream | null>(null); // teacher camera+mic
+  const localStreamRef = useRef<MediaStream | null>(null); // broadcast stream (demo video + mic)
+  const micStreamRef = useRef<MediaStream | null>(null); // real microphone (broadcast audio)
   const recorderRef = useRef<MediaRecorder | null>(null);
   const teacherVideoRef = useRef<HTMLVideoElement | null>(null);
   const studentVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -122,6 +201,12 @@ export default function Page() {
   const sourceBufferRef = useRef<SourceBuffer | null>(null);
   const chunkQueueRef = useRef<ArrayBuffer[]>([]);
   const liveRef = useRef(false); // teacher class is broadcasting (keeps captions alive)
+  // ---- F3 transcript / caption-translation refs ----
+  const capIdRef = useRef(0); // monotonic id for transcript lines
+  const capTranslateRef = useRef(false); // live value of capTranslate for the ws handler
+  const ttsLangRef = useRef<Lang>("en"); // live value of ttsLang for the ws handler
+  const capTransCacheRef = useRef<Record<string, string>>({}); // `${lang}::${text}` -> translation
+  const transcriptBoxRef = useRef<HTMLDivElement | null>(null); // scroll container (autoscroll)
 
   const announce = useCallback((msg: string) => {
     setAnnounceMsg("");
@@ -225,15 +310,16 @@ export default function Page() {
     [rate, clearKeepAlive, stopAudio]
   );
 
-  // ---- Piper engine (server-synthesized audio, played via <audio>) ----
+  // ---- server-synthesized audio engine (Piper by default; OpenAI for the
+  // image-description read-aloud), played via <audio> ----
   const piperSpeak = useCallback(
-    (text: string, lang: Lang, bcp47: string) => {
+    (text: string, lang: Lang, bcp47: string, engine: "piper" | "openai" = "piper") => {
       const seq = speakSeqRef.current;
       setSpeaking(true);
       setPaused(false);
       pausedRef.current = false;
       setTtsMsg("Reading aloud…");
-      ttsSpeak(text, lang)
+      ttsSpeak(text, lang, engine)
         .then((url) => {
           if (seq !== speakSeqRef.current) {
             URL.revokeObjectURL(url); // a newer request superseded this one
@@ -261,7 +347,7 @@ export default function Page() {
           audio.play().catch(() => {
             if (seq === speakSeqRef.current) browserSpeak(text, bcp47);
           });
-          logUsage("F1", "read_aloud", { engine: "piper", lang });
+          logUsage("F1", "read_aloud", { engine, lang });
         })
         .catch(() => {
           if (seq !== speakSeqRef.current) return;
@@ -273,16 +359,19 @@ export default function Page() {
   );
 
   const speak = useCallback(
-    (text: string, langOverride?: Lang) => {
+    (text: string, langOverride?: Lang, engine: "piper" | "openai" = "piper") => {
       if (!text || !text.trim()) {
         setTtsMsg("Add some text first, then press Read Aloud.");
         return;
       }
       const info = langInfo(langOverride ?? ttsLang);
-      speakSeqRef.current += 1; // invalidate any in-flight Piper request
+      speakSeqRef.current += 1; // invalidate any in-flight request
       stopAudio();
-      if (info.piper) {
-        // stop any browser speech cleanly before switching to Piper audio
+      // OpenAI TTS handles any language (used for the mixed-language image
+      // description); Piper only for its supported languages.
+      const useServer = engine === "openai" || info.piper;
+      if (useServer) {
+        // stop any browser speech cleanly before switching to server audio
         const synth = typeof window !== "undefined" ? window.speechSynthesis : null;
         utterRef.current = null;
         clearKeepAlive();
@@ -293,7 +382,7 @@ export default function Page() {
             /* ignore */
           }
         }
-        piperSpeak(text, info.code, info.bcp47);
+        piperSpeak(text, info.code, info.bcp47, engine);
       } else {
         browserSpeak(text, info.bcp47);
       }
@@ -474,10 +563,32 @@ export default function Page() {
     r.readAsDataURL(f);
   };
 
+  // ---- F2 learning picture — generate an illustration of the given text ----
+  const runIllustrate = useCallback(async (text: string) => {
+    const src = text.trim();
+    if (!src) return;
+    setSimpImgBusy(true);
+    setSimpImg("");
+    setSimpImgMsg("");
+    try {
+      const url = await apiIllustrate(src);
+      setSimpImg(url);
+      logUsage("F2", "illustrate");
+      announce("Picture generated.");
+    } catch {
+      setSimpImgMsg("Could not generate a picture right now. Please try again.");
+    } finally {
+      setSimpImgBusy(false);
+    }
+  }, [announce]);
+
   // ---- simplify (F2) — powered by the FastAPI backend ----
   const doSimplify = useCallback(async () => {
     if (!simpIn.trim()) return;
     setSimpBusy(true);
+    // A new simplification invalidates any previously generated picture.
+    setSimpImg("");
+    setSimpImgMsg("");
     try {
       const res = await apiSimplify(simpIn);
       setSimpOut(res.simplified);
@@ -486,6 +597,8 @@ export default function Page() {
       announce(
         `Text simplified. Reading level dropped from grade ${res.grade_before} to grade ${res.grade_after}.`
       );
+      // Automatically generate a learning picture for the simplified text.
+      runIllustrate(res.simplified);
     } catch {
       setSimpOut(
         "Could not reach the InclusionAI server. Make sure the backend is running, then try again."
@@ -495,7 +608,7 @@ export default function Page() {
     } finally {
       setSimpBusy(false);
     }
-  }, [simpIn, announce]);
+  }, [simpIn, announce, runIllustrate]);
 
   // ---- captions (F3): stop the teacher's microphone ----
   const stopRec = useCallback(() => {
@@ -607,6 +720,93 @@ export default function Page() {
     setPeers(0);
   }, []);
 
+  // ---- F3 transcript + live caption translation ----
+  // Translate one finalized caption into `lang` (cached; no-op for English).
+  const translateCaption = useCallback((id: number, text: string, lang: Lang) => {
+    if (lang === "en") return;
+    const key = `${lang}::${text}`;
+    const cached = capTransCacheRef.current[key];
+    if (cached) {
+      setTranscript((prev) => prev.map((c) => (c.id === id ? { ...c, tr: cached } : c)));
+      return;
+    }
+    apiTranslate(text, lang)
+      .then((out) => {
+        capTransCacheRef.current[key] = out;
+        setTranscript((prev) => prev.map((c) => (c.id === id ? { ...c, tr: out } : c)));
+      })
+      .catch(() => {
+        /* leave the original text if translation is unreachable */
+      });
+  }, []);
+
+  // Append a finalized caption line. Translates it live (into the current
+  // language) whenever caption-translate is on — reading the refs so it works
+  // for both the teacher's own captions and captions received by a student.
+  const addFinalCaption = useCallback(
+    (text: string) => {
+      const clean = text.trim();
+      if (!clean) return;
+      const id = (capIdRef.current += 1);
+      setTranscript((prev) => [...prev, { id, t: nowHM(), text: clean }]);
+      setCapInterim("");
+      if (capTranslateRef.current && ttsLangRef.current !== "en") {
+        translateCaption(id, clean, ttsLangRef.current);
+      }
+    },
+    [translateCaption]
+  );
+
+  const clearTranscript = useCallback(() => {
+    setTranscript([]);
+    setCapInterim("");
+  }, []);
+
+  // Download the transcript as a plain-text file for later review.
+  const saveTranscript = useCallback(() => {
+    if (transcript.length === 0) return;
+    const lines = transcript.map((c) => `[${c.t}] ${c.tr ?? c.text}`);
+    const header = `InclusionAI — live class transcript (class ${room || "class"})\n\n`;
+    const blob = new Blob([header + lines.join("\n") + "\n"], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `inclusionai-transcript-${room || "class"}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }, [transcript, room]);
+
+  // Keep refs in sync so the ws message handler reads live values, not a stale closure.
+  useEffect(() => {
+    capTranslateRef.current = capTranslate;
+  }, [capTranslate]);
+  useEffect(() => {
+    ttsLangRef.current = ttsLang;
+  }, [ttsLang]);
+
+  // Default captions to the chosen language: on when it's not English, off for
+  // English. The user can still flip the Original/translated toggle afterwards.
+  useEffect(() => {
+    setCapTranslate(ttsLang !== "en");
+  }, [ttsLang]);
+
+  // When caption-translate turns on (or the language changes while on), (re)translate
+  // every existing line into the current language.
+  useEffect(() => {
+    if (!capTranslate || ttsLang === "en") return;
+    transcript.forEach((c) => translateCaption(c.id, c.text, ttsLang));
+    // Re-run only when the toggle/language changes; lines are read from the closure.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [capTranslate, ttsLang]);
+
+  // Auto-scroll the transcript to the newest line.
+  useEffect(() => {
+    const el = transcriptBoxRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [transcript, capInterim]);
+
   // Open a WebSocket to the room, announce who we are, and resolve once connected.
   const connectWs = useCallback(
     (r: string, identityRole: Role, name: string) =>
@@ -649,14 +849,12 @@ export default function Page() {
           } else if (msg.type === "caption") {
             // Incoming caption from the teacher (students only receive these).
             if (msg.final) {
-              setCapFinal((prev) => (prev ? prev + " " : "") + String(msg.text).trim());
-              setCapInterim("");
+              addFinalCaption(String(msg.text));
             } else {
               setCapInterim(String(msg.text));
             }
           } else if (msg.type === "clear") {
-            setCapFinal("");
-            setCapInterim("");
+            clearTranscript();
           }
         };
         ws.onerror = () => {
@@ -670,7 +868,7 @@ export default function Page() {
         };
         wsRef.current = ws;
       }),
-    [appendVideoChunk, setupStudentVideo, teardownStudentVideo]
+    [appendVideoChunk, setupStudentVideo, teardownStudentVideo, addFinalCaption, clearTranscript]
   );
 
   // ---- teacher: broadcast camera + mic + captions to students ----
@@ -698,9 +896,25 @@ export default function Page() {
       });
       localStreamRef.current = null;
     }
+    // stop the real microphone
+    const mic = micStreamRef.current;
+    if (mic) {
+      mic.getTracks().forEach((t) => {
+        try {
+          t.stop();
+        } catch {
+          /* ignore */
+        }
+      });
+      micStreamRef.current = null;
+    }
+    // stop & reset the demo-video self-view
     if (teacherVideoRef.current) {
       try {
+        teacherVideoRef.current.pause();
+        teacherVideoRef.current.removeAttribute("src");
         teacherVideoRef.current.srcObject = null;
+        teacherVideoRef.current.load();
       } catch {
         /* ignore */
       }
@@ -734,21 +948,45 @@ export default function Page() {
     }
     liveRef.current = true;
 
-    // --- camera + mic → MediaRecorder → WebSocket ---
+    // --- demo video (frames) + real mic (audio) → MediaRecorder → WebSocket ---
+    // The video feed is a bundled demo clip instead of the webcam; the teacher's
+    // real microphone still supplies the broadcast audio (and captions).
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      localStreamRef.current = stream;
-      if (teacherVideoRef.current) {
-        teacherVideoRef.current.srcObject = stream;
-        teacherVideoRef.current.muted = true; // avoid the teacher hearing themselves
-        teacherVideoRef.current.play().catch(() => {});
+      // Real microphone for the broadcast audio.
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micStreamRef.current = micStream;
+
+      // Play the demo clip in the teacher's self-view and capture its frames.
+      const demo = teacherVideoRef.current;
+      let broadcastStream: MediaStream;
+      if (demo && typeof (demo as any).captureStream === "function") {
+        demo.srcObject = null;
+        demo.src = "/demo_class.mp4";
+        demo.loop = true;
+        demo.muted = true; // don't play the clip's own audio to the teacher
+        demo.playsInline = true;
+        try {
+          await demo.play();
+        } catch {
+          /* autoplay may need the user gesture that started the class; ignore */
+        }
+        const captured: MediaStream = (demo as any).captureStream();
+        broadcastStream = new MediaStream();
+        const vtrack = captured.getVideoTracks()[0];
+        if (vtrack) broadcastStream.addTrack(vtrack);
+        micStream.getAudioTracks().forEach((t) => broadcastStream.addTrack(t));
+      } else {
+        // captureStream unsupported → audio-only broadcast (captions still work).
+        broadcastStream = micStream;
       }
+      localStreamRef.current = broadcastStream;
+
       const candidates = ["video/webm;codecs=vp8,opus", "video/webm;codecs=vp9,opus", "video/webm"];
       const mime =
         (typeof MediaRecorder !== "undefined" && candidates.find((m) => MediaRecorder.isTypeSupported(m))) || "";
-      if (mime) {
+      if (mime && broadcastStream.getVideoTracks().length > 0) {
         if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "video_start", mime }));
-        const recr = new MediaRecorder(stream, { mimeType: mime });
+        const recr = new MediaRecorder(broadcastStream, { mimeType: mime });
         recr.ondataavailable = (e) => {
           if (e.data && e.data.size > 0 && ws.readyState === WebSocket.OPEN) ws.send(e.data);
         };
@@ -757,7 +995,7 @@ export default function Page() {
         setVideoOn(true);
       }
     } catch {
-      announce("Camera or microphone unavailable — broadcasting captions only.");
+      announce("Microphone unavailable — broadcasting captions only.");
     }
 
     // --- on-device captions via SpeechRecognition ---
@@ -781,7 +1019,9 @@ export default function Page() {
           };
           if (finalAdd) {
             const clean = finalAdd.trim();
-            setCapFinal((prev) => (prev ? prev + " " : "") + clean);
+            // Always send the original to students; the transcript translates
+            // locally when caption-translate is on (teacher or student).
+            addFinalCaption(clean);
             send(true, clean);
           }
           setCapInterim(interim);
@@ -809,7 +1049,7 @@ export default function Page() {
     setCapActive(true);
     announce("Class is live. Streaming your camera and captions to students.");
     logUsage("F3", "broadcast_start", { room, video: !!recorderRef.current });
-  }, [connectWs, room, announce, stopBroadcast]);
+  }, [connectWs, room, announce, stopBroadcast, addFinalCaption]);
 
   // Generate a fresh, human-friendly class code (teacher "create class").
   const newClassCode = useCallback(() => {
@@ -821,8 +1061,7 @@ export default function Page() {
 
   // ---- student: join / leave the live class ----
   const joinClass = useCallback(async () => {
-    setCapFinal("");
-    setCapInterim("");
+    clearTranscript();
     try {
       await connectWs(room, "student", studentName.trim() || "Guest");
       announce("Joined the class. Captions will appear as the teacher speaks.");
@@ -831,7 +1070,7 @@ export default function Page() {
       setWsStatus("idle");
       announce("Could not connect to the class. Is the backend running?");
     }
-  }, [connectWs, room, studentName, announce]);
+  }, [connectWs, room, studentName, announce, clearTranscript]);
 
   const leaveClass = useCallback(() => {
     closeWs();
@@ -839,8 +1078,7 @@ export default function Page() {
   }, [closeWs, announce]);
 
   const clearCap = () => {
-    setCapFinal("");
-    setCapInterim("");
+    clearTranscript();
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "clear" }));
@@ -1048,6 +1286,12 @@ export default function Page() {
     : connected
     ? "#0a8f4c"
     : "var(--muted)";
+
+  // Latest finalized caption (translated if available) — for the video overlay band.
+  const lastCap = transcript.length > 0 ? transcript[transcript.length - 1] : null;
+  const lastCapText = lastCap ? lastCap.tr ?? lastCap.text : "";
+  // Short label for the caption-language toggle (e.g. "বাংলা").
+  const capLangLabel = langInfo(ttsLang).label.split(" · ").pop() || langInfo(ttsLang).label;
 
   const rootStyle: React.CSSProperties = {
     fontSize: `${fontPct}%`,
@@ -1639,7 +1883,7 @@ export default function Page() {
                   </div>
                 )}
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 14 }}>
-                  <button type="button" onClick={() => speak(imgDesc)} disabled={!imgDesc || imgDescBusy} style={{ ...S.btnPrimary, opacity: !imgDesc || imgDescBusy ? 0.5 : 1 }}>
+                  <button type="button" onClick={() => speak(imgDesc, undefined, "openai")} disabled={!imgDesc || imgDescBusy} style={{ ...S.btnPrimary, opacity: !imgDesc || imgDescBusy ? 0.5 : 1 }}>
                     <Speaker />
                     Read description
                   </button>
@@ -1709,10 +1953,44 @@ export default function Page() {
                 >
                   {simpOut}
                 </div>
-                <button type="button" onClick={() => speak(simpOut)} style={{ ...S.btnGhost, marginTop: 16 }}>
-                  <Speaker />
-                  Read simplified aloud
-                </button>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 16 }}>
+                  <button type="button" onClick={() => speak(simpOut)} style={S.btnGhost}>
+                    <Speaker />
+                    Read simplified aloud
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => runIllustrate(simpOut)}
+                    disabled={simpImgBusy}
+                    style={{ ...S.btnPrimary, opacity: simpImgBusy ? 0.6 : 1, cursor: simpImgBusy ? "wait" : "pointer" }}
+                  >
+                    <Boxicon name="image" size={16} /> {simpImgBusy ? "Drawing a picture…" : simpImg ? "New picture" : "Show me a picture"}
+                  </button>
+                </div>
+
+                {simpImgMsg && (
+                  <div aria-live="polite" style={{ marginTop: 12, fontSize: ".9em", fontWeight: 700, color: "var(--red,#c62026)" }}>
+                    {simpImgMsg}
+                  </div>
+                )}
+
+                {(simpImgBusy || simpImg) && (
+                  <figure style={{ margin: "18px 0 0" }}>
+                    <div style={{ position: "relative", borderRadius: 16, overflow: "hidden", border: "1px solid var(--border)", background: "var(--chip)", aspectRatio: "1 / 1", maxWidth: 420 }}>
+                      {simpImg ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img src={simpImg} alt={`A learning picture illustrating: ${simpOut}`} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                      ) : (
+                        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", gap: 10, color: "var(--muted)", fontSize: ".92em", fontWeight: 600, textAlign: "center", padding: 20 }}>
+                          <Boxicon name="sparkles" size={18} /> Drawing a picture of this idea…
+                        </div>
+                      )}
+                    </div>
+                    <figcaption style={{ marginTop: 8, fontSize: ".8em", color: "var(--muted)" }}>
+                      AI-generated learning picture — a visual of the simplified idea.
+                    </figcaption>
+                  </figure>
+                )}
               </div>
             )}
           </div>
@@ -1842,7 +2120,7 @@ export default function Page() {
                       />
                       {!videoOn && (
                         <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#5b78b8", fontSize: ".9em", fontWeight: 600, textAlign: "center", padding: 16 }}>
-                          Your camera preview appears here when the class starts.
+                          Your demo feed appears here when the class starts.
                         </div>
                       )}
                       {videoOn && (
@@ -1851,19 +2129,39 @@ export default function Page() {
                           ON AIR
                         </span>
                       )}
+                      {videoOn && (
+                        <span style={{ position: "absolute", top: 10, right: 10, display: "inline-flex", alignItems: "center", gap: 5, fontSize: ".7em", fontWeight: 800, color: "#1a1204", background: "#f6c453", padding: "4px 9px", borderRadius: 999 }}>
+                          <Boxicon name="video" size={13} /> Demo feed
+                        </span>
+                      )}
                     </div>
-                    <div aria-live="polite" style={{ minHeight: 72, background: "#05132e", border: "1px solid var(--border)", borderRadius: 16, padding: "16px 22px", display: "flex", alignItems: "center" }}>
-                      <p style={{ margin: 0, fontFamily: "var(--display)", fontWeight: 600, fontSize: "1.4em", lineHeight: 1.35, color: "#ffffff" }}>
-                        {capFinal ? <span>{capFinal} </span> : null}
-                        {capInterim ? <span style={{ color: "#9fc0ff" }}>{capInterim}</span> : null}
-                        {!capFinal && !capInterim && (
-                          <span style={{ color: "#5b78b8", fontSize: ".8em" }}>
-                            Press <strong style={{ color: "#9fc0ff" }}>Start class</strong> — students see your captions here.
-                          </span>
-                        )}
-                        {capActive && <span style={{ animation: "caret-blink 1s step-end infinite", color: "#9fc0ff" }}> ▌</span>}
-                      </p>
+                    <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                      <span style={{ ...S.label, margin: 0 }}>Live transcript</span>
+                      <span style={{ fontSize: ".78em", fontWeight: 700, color: "var(--muted)" }}>{transcript.length} {transcript.length === 1 ? "line" : "lines"}</span>
+                      {ttsLang !== "en" && (
+                        <div role="group" aria-label="Caption language" style={{ display: "inline-flex", border: "1.5px solid var(--border)", borderRadius: 999, overflow: "hidden" }}>
+                          <button type="button" aria-pressed={!capTranslate} onClick={() => setCapTranslate(false)} style={{ padding: "6px 12px", fontSize: ".78em", fontWeight: 800, border: "none", cursor: "pointer", background: !capTranslate ? "var(--blue,#0b2e6b)" : "var(--card)", color: !capTranslate ? "#fff" : "var(--text)" }}>
+                            Original
+                          </button>
+                          <button type="button" aria-pressed={capTranslate} onClick={() => setCapTranslate(true)} style={{ padding: "6px 12px", fontSize: ".78em", fontWeight: 800, border: "none", cursor: "pointer", background: capTranslate ? "var(--blue,#0b2e6b)" : "var(--card)", color: capTranslate ? "#fff" : "var(--text)" }}>
+                            {capLangLabel}
+                          </button>
+                        </div>
+                      )}
+                      <button type="button" onClick={saveTranscript} disabled={transcript.length === 0} style={{ ...S.btnGhost, marginLeft: "auto", padding: "7px 12px", fontSize: ".82em", opacity: transcript.length === 0 ? 0.5 : 1 }}>
+                        <Boxicon name="save" size={15} /> Save
+                      </button>
                     </div>
+                    <LiveTranscript
+                      entries={transcript}
+                      interim={capInterim}
+                      live={capActive}
+                      boxRef={transcriptBoxRef}
+                      fontSize="1.15em"
+                      minHeight={120}
+                      maxHeight={220}
+                      emptyNode={<>Press <strong style={{ color: "#9fc0ff" }}>Start class</strong> — your captions appear here and stream to students.</>}
+                    />
                   </div>
                 </div>
               </>
@@ -1921,36 +2219,47 @@ export default function Page() {
                     controls
                     style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
                   />
-                  {(capFinal || capInterim) && (
+                  {(lastCapText || capInterim) && (
                     <div style={{ position: "absolute", left: 0, right: 0, bottom: 0, padding: "16px 20px", background: "linear-gradient(transparent, rgba(0,0,0,.78))", pointerEvents: "none" }}>
                       <p aria-live="assertive" style={{ margin: 0, fontFamily: "var(--display)", fontWeight: 700, fontSize: "1.5em", lineHeight: 1.3, color: "#fff", textAlign: "center", textShadow: "0 1px 4px rgba(0,0,0,.9)" }}>
-                        {capFinal ? <span>{capFinal} </span> : null}
+                        {lastCapText ? <span>{lastCapText} </span> : null}
                         {capInterim ? <span style={{ color: "#9fc0ff" }}>{capInterim}</span> : null}
                       </p>
                     </div>
                   )}
                 </div>
 
-                {/* caption-only display when there is no video yet */}
-                {!videoLive && (
-                  <div aria-live="assertive" style={{ minHeight: 180, background: "#05132e", border: "1px solid var(--border)", borderRadius: 16, padding: "26px 32px", display: "flex", alignItems: "center" }}>
-                    <p style={{ margin: 0, fontFamily: "var(--display)", fontWeight: 600, fontSize: "2.1em", lineHeight: 1.3, color: "#ffffff" }}>
-                      {capFinal ? <span>{capFinal} </span> : null}
-                      {capInterim ? <span style={{ color: "#9fc0ff" }}>{capInterim}</span> : null}
-                      {!capFinal && !capInterim && (
-                        <span style={{ color: "#5b78b8" }}>
-                          {connected ? (
-                            <>Waiting for your teacher to start…</>
-                          ) : (
-                            <>
-                              Enter your teacher&apos;s code and press <strong style={{ color: "#9fc0ff" }}>Join class</strong>.
-                            </>
-                          )}
-                        </span>
-                      )}
-                      {connected && <span style={{ animation: "caret-blink 1s step-end infinite", color: "#9fc0ff" }}> ▌</span>}
-                    </p>
-                  </div>
+                {/* live transcript + controls: scroll back, translate, save */}
+                <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, marginBottom: 12 }}>
+                  <span style={{ ...S.label, margin: 0 }}>Live transcript</span>
+                  {ttsLang !== "en" && (
+                    <div role="group" aria-label="Caption language" style={{ display: "inline-flex", border: "1.5px solid var(--border)", borderRadius: 999, overflow: "hidden" }}>
+                      <button type="button" aria-pressed={!capTranslate} onClick={() => setCapTranslate(false)} style={{ padding: "7px 14px", fontSize: ".82em", fontWeight: 800, border: "none", cursor: "pointer", background: !capTranslate ? "var(--blue,#0b2e6b)" : "var(--card)", color: !capTranslate ? "#fff" : "var(--text)" }}>
+                        Original
+                      </button>
+                      <button type="button" aria-pressed={capTranslate} onClick={() => setCapTranslate(true)} style={{ padding: "7px 14px", fontSize: ".82em", fontWeight: 800, border: "none", cursor: "pointer", background: capTranslate ? "var(--blue,#0b2e6b)" : "var(--card)", color: capTranslate ? "#fff" : "var(--text)" }}>
+                        {capLangLabel}
+                      </button>
+                    </div>
+                  )}
+                  <button type="button" onClick={saveTranscript} disabled={transcript.length === 0} style={{ ...S.btnGhost, marginLeft: "auto", padding: "8px 14px", fontSize: ".85em", opacity: transcript.length === 0 ? 0.5 : 1 }}>
+                    <Boxicon name="save" size={15} /> Save transcript
+                  </button>
+                </div>
+                <LiveTranscript
+                  entries={transcript}
+                  interim={capInterim}
+                  live={connected}
+                  boxRef={transcriptBoxRef}
+                  fontSize={videoLive ? "1.05em" : "1.35em"}
+                  minHeight={videoLive ? 130 : 200}
+                  maxHeight={videoLive ? 260 : 360}
+                  emptyNode={connected ? <>Waiting for your teacher to start…</> : <>Enter your teacher&apos;s code and press <strong style={{ color: "#9fc0ff" }}>Join class</strong>.</>}
+                />
+                {ttsLang === "en" && connected && (
+                  <p style={{ margin: "10px 2px 0", fontSize: ".82em", color: "var(--muted)" }}>
+                    Tip: pick <strong>বাংলা</strong> or another language in <strong>Language &amp; role</strong> to read captions translated.
+                  </p>
                 )}
               </>
             )}

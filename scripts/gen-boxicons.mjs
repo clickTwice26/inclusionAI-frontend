@@ -33,6 +33,8 @@ const WANT = {
   "image": ["basic", "bx-image-alt"],
   "refresh": ["basic", "bx-refresh-cw"],
   "captions": ["basic", "bx-captions-cc"],
+  "video": ["basic", "bx-movie-play"],
+  "save": ["basic", "bx-save"],
   "star": ["filled", "bx-star"],
   "stop": ["filled", "bx-stop"],
   "circle": ["filled", "bx-circle"],

@@ -47,11 +47,11 @@ export async function simplify(text: string): Promise<SimplifyResult> {
 // Synthesize speech via self-hosted Piper on the backend (English & Bangla).
 // Returns an object-URL for the audio; throws if the language is unsupported
 // (HTTP 422) or the backend is unreachable — callers fall back to browser TTS.
-export async function ttsSpeak(text: string, lang: string): Promise<string> {
+export async function ttsSpeak(text: string, lang: string, engine: "piper" | "openai" = "piper"): Promise<string> {
   const res = await fetch(`${API_BASE}/api/tts`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, lang }),
+    body: JSON.stringify({ text, lang, engine }),
   });
   if (!res.ok) throw new Error(`TTS request failed (${res.status})`);
   const blob = await res.blob();
@@ -104,6 +104,19 @@ export function logUsage(
   }).catch(() => {
     /* offline / backend down — analytics are non-essential */
   });
+}
+
+// Generate a simple learning picture for the simplified text via the backend
+// image model. Returns a data URL (PNG) ready to drop into an <img src>.
+export async function illustrate(text: string): Promise<string> {
+  const res = await fetch(`${API_BASE}/api/illustrate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw new Error(`Illustrate request failed (${res.status})`);
+  const data = await res.json();
+  return data.image_data_url as string;
 }
 
 export interface Lesson {
